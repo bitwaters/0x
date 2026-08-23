@@ -394,7 +394,7 @@ export const MIGRATIONS: readonly Migration[] = [
           WHERE x.chain = e.chain AND x.token_address = e.token_address
             AND x.stage = 'bonding_shortcut_readiness'
             AND x.reason_code = 'BONDING_POOL_OPEN_SHORTCUT_READY'
-      );
+        );
     `
   },
   {
