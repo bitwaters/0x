@@ -38,9 +38,9 @@ test('parses safe defaults without exposing provider secrets', () => {
       revivalPublic: true
     },
     bsc: {
-      bondingRank: { min: 6, max: 10 },
-      realPoolRank: { min: 6, max: 10 },
-      revivalPublic: false
+      bondingRank: { min: 1, max: 5 },
+      realPoolRank: { min: 1, max: 20 },
+      revivalPublic: true
     }
   });
   assert.equal(config.limits.coinGeckoRestRpm, 450);

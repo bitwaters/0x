@@ -168,9 +168,9 @@ test('three-rising activation resets on a missing successful snapshot', async ()
     [10_000, 30, true],
     [13_000, 20, true],
     [16_000, 0, false],
-    [19_000, 19, true],
-    [22_000, 12, true],
-    [25_000, 7, true]
+    [19_000, 15, true],
+    [22_000, 10, true],
+    [25_000, 5, true]
   ] as const) {
     now.value = time;
     const result = await engine.acceptSnapshot(
@@ -205,23 +205,23 @@ test('consecutive dual-rank activation resets when a successful 1m snapshot omit
     })
   );
 
-  await engine.acceptSnapshot(snapshot('1m', 1_000, [trendingItem({ token, rank: 7 })]));
+  await engine.acceptSnapshot(snapshot('1m', 1_000, [trendingItem({ token, rank: 5 })]));
   now.value = 1_001;
-  await engine.acceptSnapshot(snapshot('5m', 1_001, [trendingItem({ token, rank: 7 })]));
+  await engine.acceptSnapshot(snapshot('5m', 1_001, [trendingItem({ token, rank: 5 })]));
   now.value = 4_000;
   await engine.acceptSnapshot(snapshot('1m', 4_000, []));
   now.value = 11_000;
-  await engine.acceptSnapshot(snapshot('5m', 11_000, [trendingItem({ token, rank: 7 })]));
+  await engine.acceptSnapshot(snapshot('5m', 11_000, [trendingItem({ token, rank: 5 })]));
   now.value = 11_001;
-  await engine.acceptSnapshot(snapshot('1m', 11_001, [trendingItem({ token, rank: 7 })]));
+  await engine.acceptSnapshot(snapshot('1m', 11_001, [trendingItem({ token, rank: 5 })]));
   assert.equal(candidates.find('bsc', token)!.status, 'DISCOVERED');
 
   now.value = 21_000;
-  await engine.acceptSnapshot(snapshot('5m', 21_000, [trendingItem({ token, rank: 7 })]));
+  await engine.acceptSnapshot(snapshot('5m', 21_000, [trendingItem({ token, rank: 5 })]));
   now.value = 21_001;
-  await engine.acceptSnapshot(snapshot('1m', 21_001, [trendingItem({ token, rank: 7 })]));
+  await engine.acceptSnapshot(snapshot('1m', 21_001, [trendingItem({ token, rank: 5 })]));
   now.value = 31_001;
-  await engine.acceptSnapshot(snapshot('1m', 31_001, [trendingItem({ token, rank: 7 })]));
+  await engine.acceptSnapshot(snapshot('1m', 31_001, [trendingItem({ token, rank: 5 })]));
   assert.equal(candidates.find('bsc', token)!.status, 'RADAR');
   database.close();
 });
@@ -259,7 +259,7 @@ test('real-pool activation waits on low liquidity while old pools can revive and
     trendingItem({ token: good, rank: 1, marketCap: 300_000 }),
     trendingItem({ token: lowLiquidity, rank: 2 }),
     trendingItem({ token: oldPool, rank: 3 }),
-    trendingItem({ token: bonding, rank: 7 })
+    trendingItem({ token: bonding, rank: 4 })
   ];
   await engine.acceptSnapshot(snapshot('1m', now.value - 1_000, items));
   await engine.acceptSnapshot(snapshot('5m', now.value, items));
@@ -275,7 +275,7 @@ test('real-pool activation waits on low liquidity while old pools can revive and
   database.close();
 });
 
-test('BSC keeps the Top3 pool-open shortcut internal while Top7 public radar grants no shortcut', async () => {
+test('rollback restores Top3 public shortcut while Top7 still gains no shortcut', async () => {
   const now = { value: 2_100_000_000 };
   const top3 = address(14);
   const top7 = address(15);
@@ -301,8 +301,8 @@ test('BSC keeps the Top3 pool-open shortcut internal while Top7 public radar gra
   now.value += 10_000;
   await engine.acceptSnapshot(snapshot('1m', now.value, items));
 
-  assert.equal(candidates.find('bsc', top3)!.status, 'DISCOVERED');
-  assert.equal(candidates.find('bsc', top7)!.status, 'RADAR');
+  assert.equal(candidates.find('bsc', top3)!.status, 'RADAR');
+  assert.equal(candidates.find('bsc', top7)!.status, 'DISCOVERED');
   const shortcuts = database.prepare(`
     SELECT token_address FROM qualification_events
     WHERE stage = 'bonding_shortcut_readiness'
@@ -315,7 +315,7 @@ test('BSC keeps the Top3 pool-open shortcut internal while Top7 public radar gra
   const openedItems = items.map((item) => ({ ...item, openAtMs: now.value - 60_000 }));
   await engine.acceptSnapshot(snapshot('1m', now.value, openedItems));
   assert.equal(candidates.find('bsc', top3)!.status, 'PREHEAT');
-  assert.equal(candidates.find('bsc', top7)!.status, 'RADAR');
+  assert.equal(candidates.find('bsc', top7)!.status, 'DISCOVERED');
   now.value += 1;
   await engine.acceptSnapshot(snapshot('5m', now.value, openedItems));
   assert.equal(candidates.find('bsc', top7)!.status, 'PREHEAT');

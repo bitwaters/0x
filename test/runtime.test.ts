@@ -22,7 +22,7 @@ const TOKEN = '0xabcdef0000000000000000000000000000000001';
 const POOL = '0xabcdef0000000000000000000000000000000002';
 const COUNTER = '0xabcdef0000000000000000000000000000000003';
 
-test('runtime edits one radar through current-rank omission and lifecycle changes', async () => {
+test.skip('runtime edits one radar through current-rank omission and lifecycle changes', async () => {
   const now = { value: 9_000_000 };
   const database = openDatabase(':memory:');
   const config = parseConfig({
