@@ -19,7 +19,7 @@
 
 ## 4. 回滚、部署与观察
 
-- [ ] 4.1 准备并测试唯一v8兼容回滚构建：策略writer恢复SOL三次上升、直接新池和复苏当前版本readiness及首发，保留v8、两类readiness、shortcut解耦、`markRadarSent`及首次envelope；smoke三类PENDING并证明public readiness不授权shortcut，提交不可移动tag和README说明。
+- [x] 4.1 准备并测试唯一v8兼容回滚构建：策略writer恢复SOL三次上升、直接新池和复苏当前版本readiness及首发，保留v8、两类readiness、shortcut解耦、`markRadarSent`及首次envelope；smoke三类PENDING并证明public readiness不授权shortcut，提交不可移动tag和README说明。
 - [ ] 4.2 本地提交推送后，停止服务器容器、备份并校验SQLite，再由服务器`git pull --ff-only`与Docker Compose重建启动；禁止服务器直接编辑文件。
 - [ ] 4.3 记录部署时间/规则版本，核对v8合格源事件数与桥接数相等，观察至少10个成功SOL 1m和3个成功5m周期；保存按链/当前规则/初始阶段/触发分组的首发报告并断言SOL禁止类型和失效PENDING为0，SOL dual与BSC direct-new-pool无自然样本时分别标记未验证。
 - [ ] 4.4 断言部署前后qualification/evaluation策略子快照字节等价，既有activation时间、资格参考价、已投递样本和validation epoch重置数为0，终态重开数为0；任一失败只在本地修复或执行兼容回滚。

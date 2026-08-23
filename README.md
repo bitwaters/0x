@@ -133,15 +133,18 @@ Compose commands. Do not edit tracked files on the server.
 
 ### Compatible policy rollback
 
-The only supported non-destructive rollback for this change is tag
-`rollback-bsc-radar-quality-v7-20260823`, exact commit
-`c798b6480d451dae84ade5b9a17a6305f79e496d`. It restores BSC Bonding Top1–5,
-real-pool Top1–20 and revival radar while retaining the v7 schema, separate
-shortcut/public-readiness facts, policy-driven real-pool readiness writer,
-atomic `markRadarSent` and immutable first-send envelope.
+The supported non-destructive rollback for the SOL v8 policy is tag
+`rollback-sol-radar-quality-v8-20260823`, exact commit
+`0b4413461bc30bad40f08ee2a3d7a8a9cc68eed6`. It restores SOL three-rising
+Bonding, direct new-pool and revival first cards while retaining migration v8,
+separate shortcut/public-readiness facts, current evidence checks, atomic
+`markRadarSent` and the immutable first-send envelope. Its full suite includes
+smoke coverage for all three restored first-send paths and verifies that public
+readiness does not grant the internal pool-open shortcut.
 
-Use that exact ref with the current v7 database. Do not deploy an older commit
-that still treats public `RADAR` status as the BSC pool-open shortcut; a Top6–10
-card created by the current build would then gain an invalid shortcut. Restoring
-an old database backup is disaster recovery only and discards signals and
-evaluation data accumulated after the backup.
+The previous BSC v7 rollback remains available as
+`rollback-bsc-radar-quality-v7-20260823` at
+`c798b6480d451dae84ade5b9a17a6305f79e496d`. Use only these exact refs with the
+current database. Do not deploy an older commit that conflates public `RADAR`
+status with the pool-open shortcut. Restoring an old database backup is disaster
+recovery only and discards signals and evaluation data accumulated afterward.
