@@ -50,7 +50,7 @@ const QUALIFICATION_REFRESH_MS = 3_000;
 const FOLLOWUP_TICK_MS = 1_000;
 const EVALUATION_TICK_MS = 1_000;
 const PROGRESS_TICK_MS = 60_000;
-const RADAR_DELIVERY_MIN_INTERVAL_MS = 1_200;
+const RADAR_DELIVERY_MIN_INTERVAL_MS = 4_000;
 const BOUND_QUALIFICATION_BURST = 3;
 
 type RuntimeGmgnSource = TrendingSource & QualificationGmgnSource & DeliveryGmgnSource & EvaluationGmgnSource;

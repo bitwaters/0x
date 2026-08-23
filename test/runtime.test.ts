@@ -134,16 +134,18 @@ test('runtime edits one radar through current-rank omission and lifecycle change
     now: () => now.value,
     log: () => undefined
   });
-  const processRadar = async () => {
+  const processRadar = async (
+    items = candidates.listRadarCandidates()
+  ) => {
     await (runtime as unknown as {
       processRadar(items: ReturnType<CandidateRepository['listRadarCandidates']>): Promise<void>;
-    }).processRadar(candidates.listRadarCandidates());
+    }).processRadar(items);
   };
 
   await processRadar();
   assert.match(sends[0]!, /Bonding Curve 观察中/);
 
-  now.value += 3_000;
+  now.value += 4_000;
   fetches.insert({
     chain: 'bsc', interval: '1m', fetchedAtMs: now.value,
     itemCount: 0, discoveryRuleVersion: config.ruleVersion
@@ -154,7 +156,7 @@ test('runtime edits one radar through current-rank omission and lifecycle change
   await processRadar();
   assert.match(edits[0]!, /热度暂时不足/);
 
-  now.value += 3_000;
+  now.value += 4_000;
   await processRadar();
   assert.equal(edits.length, 1);
 
@@ -162,12 +164,12 @@ test('runtime edits one radar through current-rank omission and lifecycle change
   await processRadar();
   assert.match(edits[1]!, /热度暂时不足/);
 
-  now.value += 3_000;
+  now.value += 4_000;
   insertCurrent(now.value, 3);
   await processRadar();
   assert.match(edits[2]!, /当前不在公开观察区间/);
 
-  now.value += 3_000;
+  now.value += 4_000;
   insertCurrent(now.value);
   candidates.activate({
     chain: 'bsc', tokenAddress: TOKEN, opportunityType: 'new_pool',
@@ -184,14 +186,14 @@ test('runtime edits one radar through current-rank omission and lifecycle change
   });
   candidates.transition('bsc', TOKEN, 'MONITORING', { atMs: now.value });
   candidates.transition('bsc', TOKEN, 'SIGNAL_SENT', { atMs: now.value });
-  now.value += 3_000;
+  now.value += 4_000;
   await processRadar();
   assert.match(edits[4]!, /已通过正式资格/);
   assert.equal(sends.length, 1);
   assert.equal(edits.length, 5);
 
   const pendingToken = '0xabcdef0000000000000000000000000000000009';
-  now.value += 3_000;
+  now.value += 4_000;
   candidates.findOrCreate({
     chain: 'bsc', tokenAddress: pendingToken,
     firstSeenAtMs: now.value - 20_000, firstSeenPriceUsd: 0.001,
@@ -217,7 +219,7 @@ test('runtime edits one radar through current-rank omission and lifecycle change
   assert.equal(sends.length, 1);
   recordEvent(pendingToken, 'activation', 'DUAL_RANK_BONDING_CURVE');
   recordEvent(pendingToken, 'radar_public_readiness', 'BSC_RADAR_PUBLIC_READY');
-  now.value += 3_000;
+  now.value += 4_000;
   await processRadar();
   assert.equal(sends.length, 2);
   snapshots.insert({
@@ -307,7 +309,7 @@ test('runtime edits one radar through current-rank omission and lifecycle change
     atMs: now.value, terminalReason: 'TEST_REJECT'
   });
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    now.value += 3_000;
+    now.value += 4_000;
     await processRadar();
     if (edits.slice(editsBeforeRevival).some((text) => /已停止观察/.test(text))) break;
   }
@@ -363,10 +365,26 @@ test('runtime edits one radar through current-rank omission and lifecycle change
     chain: 'bsc', interval: '1m', fetchedAtMs: now.value,
     itemCount: fairTokens.length, discoveryRuleVersion: config.ruleVersion
   });
+  now.value += 4_000;
+  const fairCandidates = candidates.listRadarCandidates().filter((candidate) =>
+    fairTokens.includes(candidate.tokenAddress)
+  );
   for (const tokenAddress of fairTokens) {
-    await processRadar();
+    fairTokens.forEach((currentToken, index) => {
+      snapshots.insert({
+        chain: 'bsc', interval: '1m', fetchedAtMs: now.value,
+        tokenAddress: currentToken, rank: index + 6, priceUsd: 0.001,
+        marketCapUsd: 80_000, liquidityUsd: 12_000,
+        raw: { name: `Fair Meme ${index + 1}`, symbol: `F${index + 1}` }
+      });
+    });
+    fetches.insert({
+      chain: 'bsc', interval: '1m', fetchedAtMs: now.value,
+      itemCount: fairTokens.length, discoveryRuleVersion: config.ruleVersion
+    });
+    await processRadar(fairCandidates);
     assert.match(sends.at(-1)!, new RegExp(tokenAddress));
-    now.value += 1_200;
+    now.value += 4_000;
   }
   assert.equal(sends.length, 2 + fairTokens.length);
 
@@ -646,7 +664,7 @@ test('SOL sends only verified bonding first and upgrades only its immutable bond
     raw: {}, normalized: {}, thresholds: {}, decisionRuleVersion: config.ruleVersion
   });
   candidates.transition('sol', bondingToken, 'PREHEAT', { atMs: now.value });
-  now.value += 3_000;
+  now.value += 4_000;
   insertBatch('1m', now.value, [{ token: bondingToken, rank: 15 }]);
   await processRadar();
   assert.equal(edits.length, 1);
@@ -656,7 +674,7 @@ test('SOL sends only verified bonding first and upgrades only its immutable bond
     [directToken, 'new_pool'],
     [revivalToken, 'revival']
   ] as const) {
-    now.value += 3_000;
+    now.value += 4_000;
     createCandidate(tokenAddress, 10);
     candidates.activate({
       chain: 'sol', tokenAddress, opportunityType,
@@ -679,7 +697,7 @@ test('SOL sends only verified bonding first and upgrades only its immutable bond
   assert.equal(new OutboxRepository(database).find('sol', directToken, 'radar'), undefined);
   assert.equal(new OutboxRepository(database).find('sol', revivalToken, 'radar'), undefined);
 
-  now.value += 3_000;
+  now.value += 4_000;
   createCandidate(legacyToken, 12);
   candidates.activate({
     chain: 'sol', tokenAddress: legacyToken, opportunityType: 'new_pool',
@@ -719,7 +737,7 @@ test('SOL sends only verified bonding first and upgrades only its immutable bond
   candidates.transition('sol', legacyToken, 'REJECTED', {
     atMs: now.value, terminalReason: 'TEST_REJECT'
   });
-  now.value += 3_000;
+  now.value += 4_000;
   await processRadar();
   assert.equal(edits.length, 2);
   assert.match(edits[1]!, /已停止观察/);
@@ -730,7 +748,7 @@ test('SOL sends only verified bonding first and upgrades only its immutable bond
     null
   );
 
-  now.value += 3_000;
+  now.value += 4_000;
   candidates.findOrCreate({
     chain: 'bsc', tokenAddress: TOKEN, firstSeenAtMs: now.value - 20_000,
     firstSeenPriceUsd: 0.001, firstSeenRank: 7,
@@ -759,7 +777,7 @@ test('SOL sends only verified bonding first and upgrades only its immutable bond
   });
   await processRadar([candidates.find('bsc', TOKEN)!]);
   assert.equal(sends.length, 1);
-  now.value += 3_000;
+  now.value += 4_000;
   await processRadar([candidates.find('bsc', TOKEN)!]);
   assert.equal(sends.length, 2);
   assert.match(sends[1]!, /BNB CHAIN/);
