@@ -427,12 +427,17 @@ export class BotRuntime {
       return;
     }
     const result = await this.delivery.sendRadar(snapshot, this.abortController.signal);
-    this.emit({
-      event: 'radar_delivery',
-      chain: candidate.chain,
-      outcome: result.outcome,
-      ...(result.reason === undefined ? {} : { reason: result.reason })
-    });
+    if (
+      result.outcome !== 'DUPLICATE' &&
+      result.reason !== 'radar edit retry limit reached'
+    ) {
+      this.emit({
+        event: 'radar_delivery',
+        chain: candidate.chain,
+        outcome: result.outcome,
+        ...(result.reason === undefined ? {} : { reason: result.reason })
+      });
+    }
     return result;
   }
 

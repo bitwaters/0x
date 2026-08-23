@@ -433,6 +433,17 @@ test('radar edits one message only for semantic changes and retries a failed edi
   }
   assert.equal((await delivery.sendRadar(waiting)).outcome, 'RETRYABLE_FAILURE');
   assert.equal(telegram.edits.length, 5);
+  const exhaustedUpdatedAt = state.database.prepare(
+    'SELECT updated_at_ms FROM message_outbox WHERE message_kind = ?'
+  ).get('radar') as { updated_at_ms: number };
+  now.value += 1_000;
+  assert.equal((await delivery.sendRadar(waiting)).outcome, 'RETRYABLE_FAILURE');
+  assert.equal(
+    (state.database.prepare(
+      'SELECT updated_at_ms FROM message_outbox WHERE message_kind = ?'
+    ).get('radar') as { updated_at_ms: number }).updated_at_ms,
+    exhaustedUpdatedAt.updated_at_ms
+  );
 
   const rejected = { ...bonding, stage: 'rejected' as const };
   telegram.editErrors.push(

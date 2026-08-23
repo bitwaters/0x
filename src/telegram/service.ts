@@ -156,8 +156,17 @@ export class TelegramDeliveryService {
           this.outbox.markPayloadApplied(existing.id, appliedHash, requestedAtMs);
         }
         if (appliedHash === desiredHash) return { outcome: 'DUPLICATE' };
-        this.outbox.updateRadarPayload(existing.id, payload, requestedAtMs);
-        if (existing.lastError?.startsWith('Telegram rejected request (429):')) {
+        const samePendingPayload = this.payloadHash(existing.payload) === desiredHash;
+        const rateLimited = existing.lastError?.startsWith(
+          'Telegram rejected request (429):'
+        ) ?? false;
+        if (samePendingPayload && existing.attemptCount >= 3 && !rateLimited) {
+          return { outcome: 'RETRYABLE_FAILURE', reason: 'radar edit retry limit reached' };
+        }
+        if (!samePendingPayload) {
+          this.outbox.updateRadarPayload(existing.id, payload, requestedAtMs);
+        }
+        if (rateLimited) {
           this.outbox.resetRadarRateLimitAttempts(existing.id, requestedAtMs);
         }
         if (!this.outbox.claimRadarEdit(existing.id, requestedAtMs)) {
