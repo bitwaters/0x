@@ -125,5 +125,19 @@ docker compose logs --tail=100 bot
 Before deployment, stop the service and copy the complete SQLite set to a
 timestamped backup location. Deploy source updates only after local checks and
 push by using `git pull --ff-only`, then rebuild and restart with the same
-Compose commands. Roll back by deploying the previous Git commit and restoring
-the matching stopped-database backup. Do not edit tracked files on the server.
+Compose commands. Do not edit tracked files on the server.
+
+### Compatible policy rollback
+
+The only supported non-destructive rollback for this change is tag
+`rollback-bsc-radar-quality-v7-20260823`, exact commit
+`c798b6480d451dae84ade5b9a17a6305f79e496d`. It restores BSC Bonding Top1–5,
+real-pool Top1–20 and revival radar while retaining the v7 schema, separate
+shortcut/public-readiness facts, policy-driven real-pool readiness writer,
+atomic `markRadarSent` and immutable first-send envelope.
+
+Use that exact ref with the current v7 database. Do not deploy an older commit
+that still treats public `RADAR` status as the BSC pool-open shortcut; a Top6–10
+card created by the current build would then gain an invalid shortcut. Restoring
+an old database backup is disaster recovery only and discards signals and
+evaluation data accumulated after the backup.
