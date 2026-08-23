@@ -86,6 +86,27 @@ function openV6Database(path: string): DatabaseSync {
   return openVersionDatabase(path, 6);
 }
 
+test('keeps deployed migration definitions byte-for-byte immutable', () => {
+  const expected = [
+    [1, 'initial_state', '76aa18d2e33220ffe9a45e80d44364f00027c94a56cfc3176d3536733788fd85'],
+    [2, 'successful_rank_fetches', '4a584a4159def1d3214ad57d21f0debba924961d1a42f3bdc6f10affb4784aa8'],
+    [3, 'compact_rank_fetches', 'b18597ed69162e5d31ce94d70b8365d8f877e9f8984162683789c66c8a12d3a4'],
+    [4, 'signal_delivery_followups', '095202d5fa46f0e65c4f9bae9526221783c317459a5d4e7374a332dd4995d712'],
+    [5, 'signal_evaluation_and_chain_release', '46045d974db1604099a3f494da4b20acb50c40a9736096b7720d9c7188758bcf'],
+    [6, 'optimized_low_cap_signal_rules', '0bb75ca1cdbd6d35f8d25fdb728a9a93b07e9e446d508de54a96376e18549650'],
+    [7, 'immutable_radar_initial_payload', 'edc6b3aa678d8df5e82fdaf2ae6d6936ff0ba571393ebaf52f311c7e3e685d7a'],
+    [8, 'sol_bonding_shortcut_bridge', '40feeecf1326df318de1ca85dfdd568d14bc02f3ce524d303fc9ad299013e497']
+  ];
+  assert.deepEqual(
+    MIGRATIONS.map((migration) => [
+      migration.version,
+      migration.name,
+      createHash('sha256').update(migration.sql).digest('hex')
+    ]),
+    expected
+  );
+});
+
 test('creates all migrations and enables WAL for file databases', () => {
   const directory = mkdtempSync(join(tmpdir(), 'meme-signal-db-'));
   const database = openDatabase(join(directory, 'state.db'));
