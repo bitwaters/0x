@@ -436,7 +436,7 @@ test('runtime edits one radar through current-rank omission and lifecycle change
   database.close();
 });
 
-test('SOL sends only verified bonding first and upgrades only its immutable bonding card', async () => {
+test('SOL rollback sends bonding, direct new-pool and revival first cards', async () => {
   const now = { value: 20_000_000 };
   const bondingToken = 'So11111111111111111111111111111111111111112';
   const directToken = '11111111111111111111111111111111';
@@ -567,10 +567,16 @@ test('SOL sends only verified bonding first and upgrades only its immutable bond
     ]);
     await processRadar();
   }
-  assert.equal(sends.length, 1);
+  assert.equal(sends.length, 3);
   assert.equal(edits.length, 1);
-  assert.equal(new OutboxRepository(database).find('sol', directToken, 'radar'), undefined);
-  assert.equal(new OutboxRepository(database).find('sol', revivalToken, 'radar'), undefined);
+  assert.equal(new OutboxRepository(database).find('sol', directToken, 'radar')!.status, 'SENT');
+  assert.equal(new OutboxRepository(database).find('sol', revivalToken, 'radar')!.status, 'SENT');
+  for (const tokenAddress of [directToken, revivalToken]) {
+    assert.equal(events.has({
+      chain: 'sol', tokenAddress, stage: 'bonding_shortcut_readiness',
+      reasonCode: 'BONDING_POOL_OPEN_SHORTCUT_READY'
+    }), false);
+  }
 
   now.value += 3_000;
   createCandidate(legacyToken, 12);
@@ -649,11 +655,11 @@ test('SOL sends only verified bonding first and upgrades only its immutable bond
     discoveryRuleVersion: config.ruleVersion
   });
   await processRadar([candidates.find('bsc', TOKEN)!]);
-  assert.equal(sends.length, 1);
+  assert.equal(sends.length, 3);
   now.value += 3_000;
   await processRadar([candidates.find('bsc', TOKEN)!]);
-  assert.equal(sends.length, 2);
-  assert.match(sends[1]!, /BNB CHAIN/);
+  assert.equal(sends.length, 4);
+  assert.match(sends[3]!, /BNB CHAIN/);
   assert.equal(events.has({
     chain: 'bsc', tokenAddress: TOKEN, stage: 'radar_public_readiness',
     reasonCode: 'BSC_RADAR_PUBLIC_READY', decisionRuleVersion: config.ruleVersion

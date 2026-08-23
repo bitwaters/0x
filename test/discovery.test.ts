@@ -378,7 +378,7 @@ test('SOL keeps its Top5 dual-rank radar and fact-based pool-open shortcut', asy
   database.close();
 });
 
-test('SOL three-rising heat stays internal but preserves its pool-open shortcut', async () => {
+test('SOL rollback publishes three-rising heat and preserves its pool-open shortcut', async () => {
   const now = { value: 2_300_000_000 };
   const token = 'So11111111111111111111111111111111111111112';
   let poolOpen = false;
@@ -398,7 +398,7 @@ test('SOL three-rising heat stays internal but preserves its pool-open shortcut'
     );
   }
 
-  assert.equal(candidates.find('sol', token)!.status, 'DISCOVERED');
+  assert.equal(candidates.find('sol', token)!.status, 'RADAR');
   assert.equal(database.prepare(`
     SELECT count(*) AS count FROM qualification_events
     WHERE chain = 'sol' AND stage = 'bonding_shortcut_readiness'
@@ -406,7 +406,7 @@ test('SOL three-rising heat stays internal but preserves its pool-open shortcut'
   assert.equal(database.prepare(`
     SELECT count(*) AS count FROM qualification_events
     WHERE chain = 'sol' AND stage = 'radar_public_readiness'
-  `).get()!.count, 0);
+  `).get()!.count, 1);
 
   database.prepare(`
     UPDATE candidates SET legacy_reopened_at_ms = ?
@@ -417,7 +417,7 @@ test('SOL three-rising heat stays internal but preserves its pool-open shortcut'
   await engine.acceptSnapshot(snapshot('1m', now.value, [trendingItem({
     chain: 'sol', token, rank: 4, openAtMs: now.value - 60_000
   })], 'sol'));
-  assert.equal(candidates.find('sol', token)!.status, 'DISCOVERED');
+  assert.equal(candidates.find('sol', token)!.status, 'RADAR');
 
   poolOpen = false;
   for (const rank of [7, 6, 4]) {

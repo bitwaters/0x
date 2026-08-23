@@ -8,9 +8,9 @@ export const DISCOVERY_POLICY = {
     sol: {
       bondingRank: { min: 1, max: 5 },
       realPoolRank: { min: 1, max: 20 },
-      bondingTriggers: ['DUAL_RANK'],
-      directRealPool: false,
-      revivalPublic: false
+      bondingTriggers: ['DUAL_RANK', 'THREE_RISING_1M'],
+      directRealPool: true,
+      revivalPublic: true
     },
     bsc: {
       bondingRank: { min: 6, max: 10 },
