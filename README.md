@@ -134,13 +134,18 @@ Compose commands. Do not edit tracked files on the server.
 ### Compatible policy rollback
 
 The supported non-destructive rollback for the SOL v8 policy is tag
-`rollback-sol-radar-quality-v8-20260823`, exact commit
-`0b4413461bc30bad40f08ee2a3d7a8a9cc68eed6`. It restores SOL three-rising
+`rollback-sol-radar-quality-v8-20260823-r2`, exact commit
+`62706c83069fb7d1a97a2dd0bff360e6d55763b8`. It restores SOL three-rising
 Bonding, direct new-pool and revival first cards while retaining migration v8,
 separate shortcut/public-readiness facts, current evidence checks, atomic
 `markRadarSent` and the immutable first-send envelope. Its full suite includes
 smoke coverage for all three restored first-send paths and verifies that public
 readiness does not grant the internal pool-open shortcut.
+
+Do not use the superseded tag `rollback-sol-radar-quality-v8-20260823`; it was
+published before the deployed v7 migration checksum was restored and therefore
+fails closed against a production database. The tag remains immutable only as
+an audit record.
 
 The previous BSC v7 rollback remains available as
 `rollback-bsc-radar-quality-v7-20260823` at
