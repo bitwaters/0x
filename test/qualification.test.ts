@@ -34,13 +34,13 @@ function trade(id: string, kind: 'buy' | 'sell', volumeUsd: number, atMs: number
     id,
     kind,
     blockTimestampMs: atMs,
-    volumeUsd,
+    volumeUsd: volumeUsd * 5,
     candidatePriceUsd: 0.001,
     fromTokenAddress: kind === 'buy' ? COUNTER : TOKEN,
     toTokenAddress: kind === 'buy' ? TOKEN : COUNTER,
     fromTokenAmount: 1,
     toTokenAmount: 1,
-    raw: { id, kind, volumeUsd }
+    raw: { id, kind, volumeUsd: volumeUsd * 5 }
   };
 }
 
@@ -86,7 +86,9 @@ test('30-second trades use provider IDs once and pass exact momentum boundaries'
   assert.equal(decision.passed, true);
   assert.equal(decision.trades.length, 5);
   assert.equal(decision.buyCountRatio, 0.6);
-  assert.equal(decision.netBuyUsd, 60);
+  assert.equal(decision.totalUsd, 500);
+  assert.equal(decision.buyUsdRatio, 0.8);
+  assert.equal(decision.netBuyUsd, 300);
   assert.equal(decision.largestTradeRatio, 0.4);
 });
 
@@ -103,6 +105,7 @@ test('trade window waits on low count, stale latest, weak net buys or a dominant
   );
   assert.deepEqual(decision.reasons, [
     'TRADE_COUNT_LOW',
+    'TRADE_VOLUME_LOW',
     'LATEST_TRADE_STALE',
     'BUY_COUNT_RATIO_LOW',
     'LARGEST_TRADE_TOO_HIGH'
@@ -113,9 +116,10 @@ test('trade window treats missing facts as waiting and conflicting provider IDs 
   const now = 2_100_000;
   assert.deepEqual(evaluateTradeWindow([], now).reasons, [
     'TRADE_COUNT_LOW',
+    'TRADE_VOLUME_LOW',
     'LATEST_TRADE_STALE',
     'BUY_COUNT_RATIO_LOW',
-    'NET_BUY_NOT_POSITIVE',
+    'BUY_USD_RATIO_LOW',
     'LARGEST_TRADE_TOO_HIGH'
   ]);
   const valid = [
@@ -160,7 +164,7 @@ test('liquidity stability uses the candidate counter side and inclusive boundari
     second: detail(11_000, { reserve: 10_799 }),
     liquidityMinUsd: 10_000
   });
-  assert.equal(fastLoss.outcome, 'REJECT');
+  assert.equal(fastLoss.outcome, 'WAIT');
   assert.deepEqual(fastLoss.reasons, ['POOL_LIQUIDITY_DECLINE']);
   assert.equal(
     evaluateLiquiditySample(detail(1_000, { quoteLiquidity: 100 / 0.03001 }), 10_000)
@@ -320,6 +324,14 @@ function qualificationSetup(now: { value: number }) {
     firstSeenLiquidityUsd: 15_000,
     discoveryRuleVersion: config.ruleVersion
   });
+  candidates.activate({
+    chain: 'bsc',
+    tokenAddress: TOKEN,
+    opportunityType: 'new_pool',
+    priceUsd: 0.001,
+    ruleVersion: config.ruleVersion,
+    atMs: now.value
+  });
   candidates.transition('bsc', TOKEN, 'PREHEAT', { atMs: now.value });
   new QualificationEventRepository(database).record({
     chain: 'bsc',
@@ -453,7 +465,7 @@ test('a changed GMGN main pool terminates the fixed candidate and releases subsc
   database.close();
 });
 
-test('the first invalid pool sample rejects before subscription', async () => {
+test('the first nonzero low-liquidity sample binds and waits for recovery', async () => {
   const now = { value: 5_000_000 };
   const { database, config, candidates } = qualificationSetup(now);
   const subscribed: string[] = [];
@@ -473,9 +485,10 @@ test('the first invalid pool sample rejects before subscription', async () => {
     () => now.value,
     (_chain, pool) => subscribed.push(pool)
   );
-  assert.equal((await service.refresh('bsc', TOKEN)).outcome, 'REJECTED');
-  assert.equal(candidates.find('bsc', TOKEN)!.terminalReason, 'POOL_LIQUIDITY_LOW');
-  assert.deepEqual(subscribed, []);
+  assert.equal((await service.refresh('bsc', TOKEN)).outcome, 'WAIT');
+  assert.equal(candidates.find('bsc', TOKEN)!.status, 'POOL_BOUND');
+  assert.equal(candidates.find('bsc', TOKEN)!.terminalReason, null);
+  assert.deepEqual(subscribed, [POOL]);
   database.close();
 });
 
@@ -720,6 +733,14 @@ test('a shared G2 pool is released only after its final candidate terminates', a
     firstSeenMarketCapUsd: 200_000,
     firstSeenLiquidityUsd: 15_000,
     discoveryRuleVersion: config.ruleVersion
+  });
+  candidates.activate({
+    chain: 'bsc',
+    tokenAddress: COUNTER,
+    opportunityType: 'new_pool',
+    priceUsd: 1,
+    ruleVersion: config.ruleVersion,
+    atMs: now.value
   });
   candidates.transition('bsc', COUNTER, 'PREHEAT', { atMs: now.value });
   const bindings = new PoolBindingRepository(database);

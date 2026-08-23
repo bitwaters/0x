@@ -83,10 +83,7 @@ const environmentSchema = z
     TELEGRAM_FORMAL_CHAT_ID: z.string().trim().optional(),
     GMGN_POLL_1M_MS: integerInRange(3_000, 1_000, 5_000),
     GMGN_POLL_5M_MS: integerInRange(10_000, 6_000, 12_000),
-    MARKET_CAP_MIN_USD: positiveNumber(20_000),
-    MARKET_CAP_MAX_USD: positiveNumber(500_000),
     LIQUIDITY_MIN_USD: positiveNumber(10_000),
-    POOL_AGE_MAX_SECONDS: integerInRange(21_600, 60, 604_800),
     QUALIFICATION_WINDOW_SECONDS: integerInRange(120, 30, 600),
     MAX_OBSERVED_GAIN_RATIO: ratio(0.8),
     TOP10_MAX_RATIO: ratio(0.25),
@@ -104,14 +101,6 @@ const environmentSchema = z
         code: 'custom',
         path: ['SOL_ENABLED'],
         message: 'at least one chain must be enabled'
-      });
-    }
-
-    if (value.MARKET_CAP_MIN_USD >= value.MARKET_CAP_MAX_USD) {
-      context.addIssue({
-        code: 'custom',
-        path: ['MARKET_CAP_MAX_USD'],
-        message: 'must be greater than MARKET_CAP_MIN_USD'
       });
     }
 
@@ -207,7 +196,6 @@ export interface RuntimeConfig {
     readonly marketCapMinUsd: number;
     readonly marketCapMaxUsd: number;
     readonly liquidityMinUsd: number;
-    readonly poolAgeMaxSeconds: number;
     readonly qualificationWindowSeconds: number;
     readonly maxObservedGainRatio: number;
     readonly top10MaxRatio: number;
@@ -278,10 +266,9 @@ export function parseConfig(environment: NodeJS.ProcessEnv): RuntimeConfig {
       fiveMinuteMs: value.GMGN_POLL_5M_MS
     },
     thresholds: {
-      marketCapMinUsd: value.MARKET_CAP_MIN_USD,
-      marketCapMaxUsd: value.MARKET_CAP_MAX_USD,
+      marketCapMinUsd: DISCOVERY_POLICY.internalMarketCapUsd.min,
+      marketCapMaxUsd: DISCOVERY_POLICY.internalMarketCapUsd.max,
       liquidityMinUsd: value.LIQUIDITY_MIN_USD,
-      poolAgeMaxSeconds: value.POOL_AGE_MAX_SECONDS,
       qualificationWindowSeconds: value.QUALIFICATION_WINDOW_SECONDS,
       maxObservedGainRatio: value.MAX_OBSERVED_GAIN_RATIO,
       top10MaxRatio: value.TOP10_MAX_RATIO,

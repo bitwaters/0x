@@ -194,6 +194,9 @@ export class FixedPoolQualificationService {
     }
     const latest = matchingItems[0];
     if (latest === undefined) return { outcome: 'WAIT', reasons: ['NOT_ON_LATEST_RANK'] };
+    if (latest.rank > QUALIFICATION_POLICY.trendingRankMax) {
+      return { outcome: 'WAIT', reasons: ['RANK_OUTSIDE_TOP20'] };
+    }
     if (
       info.chain !== chain ||
       info.tokenAddress !== token ||
@@ -215,12 +218,13 @@ export class FixedPoolQualificationService {
       return { outcome: 'WAIT', reasons: ['GMGN_FACTS_STALE'] };
     }
     if (
-      latest.marketCapUsd < this.config.thresholds.marketCapMinUsd ||
-      latest.marketCapUsd > this.config.thresholds.marketCapMaxUsd
+      latest.marketCapUsd < QUALIFICATION_POLICY.marketCapUsd.min ||
+      latest.marketCapUsd > QUALIFICATION_POLICY.marketCapUsd.max
     ) {
-      return this.reject(chain, token, 'MARKET_CAP_OUT_OF_RANGE', {
-        marketCapUsd: latest.marketCapUsd
-      });
+      return { outcome: 'WAIT', reasons: ['MARKET_CAP_OUT_OF_RANGE'] };
+    }
+    if (candidate.activationAtMs === null || candidate.activationPriceUsd === null) {
+      return { outcome: 'WAIT', reasons: ['ACTIVATION_BASELINE_REQUIRED'] };
     }
     const observed = this.candidates.updateHighWater({
       chain,
@@ -269,9 +273,7 @@ export class FixedPoolQualificationService {
       return this.reject(chain, token, 'MAIN_POOL_NOT_OPEN', { info: info.raw });
     }
     if (
-      info.poolCreatedAtMs === null ||
-      info.poolCreatedAtMs > factsAtMs ||
-      factsAtMs - info.poolCreatedAtMs > this.config.thresholds.poolAgeMaxSeconds * 1_000
+      info.poolCreatedAtMs === null || info.poolCreatedAtMs > factsAtMs
     ) {
       return this.reject(chain, token, 'POOL_AGE_OUT_OF_RANGE', { info: info.raw });
     }
@@ -279,7 +281,7 @@ export class FixedPoolQualificationService {
       info.liquidityUsd === null ||
       info.liquidityUsd < this.config.thresholds.liquidityMinUsd
     ) {
-      return this.reject(chain, token, 'GMGN_LIQUIDITY_LOW', { info: info.raw });
+      return { outcome: 'WAIT', reasons: ['GMGN_LIQUIDITY_LOW'] };
     }
     let persisted = this.pools.find(chain, token);
     if (persisted !== undefined && persisted.poolAddress !== info.biggestPoolAddress) {
@@ -319,18 +321,11 @@ export class FixedPoolQualificationService {
       return this.reject(chain, token, 'POOL_COMPOSITION_CHANGED', { detail: detail.raw });
     }
 
-    const sample = evaluateLiquiditySample(detail, this.config.thresholds.liquidityMinUsd);
-    if (!sample.passed) {
-      return this.reject(chain, token, sample.reasons[0]!, {
-        detail: detail.raw,
-        sample
-      });
-    }
-
     const key = `${chain}:${token}`;
     let state = this.states.get(key);
+    let createdBinding = false;
     if (persisted === undefined) {
-      const created = this.pools.bind({
+      createdBinding = this.pools.bind({
         chain,
         tokenAddress: token,
         poolAddress: detail.poolAddress,
@@ -352,12 +347,22 @@ export class FixedPoolQualificationService {
         }
       });
       persisted = this.pools.find(chain, token)!;
-      if (created) {
-        this.ensurePoolSubscribed(chain, token, detail.poolAddress);
-        state = { firstDetail: detail };
-        this.states.set(key, state);
-        return { outcome: 'WAIT', reasons: ['SECOND_DETAIL_REQUIRED'], pool: detail };
+      this.ensurePoolSubscribed(chain, token, detail.poolAddress);
+    }
+
+    const sample = evaluateLiquiditySample(detail, this.config.thresholds.liquidityMinUsd);
+    if (!sample.passed) {
+      if (detail.reserveUsd <= 0) {
+        return this.reject(chain, token, sample.reasons[0]!, { detail: detail.raw, sample });
       }
+      this.states.set(key, { firstDetail: detail });
+      return { outcome: 'WAIT', reasons: sample.reasons, pool: detail };
+    }
+
+    if (createdBinding) {
+      state = { firstDetail: detail };
+      this.states.set(key, state);
+      return { outcome: 'WAIT', reasons: ['SECOND_DETAIL_REQUIRED'], pool: detail };
     }
     this.ensurePoolSubscribed(chain, token, persisted.poolAddress);
     if (state === undefined) {
@@ -372,6 +377,9 @@ export class FixedPoolQualificationService {
       liquidityMinUsd: this.config.thresholds.liquidityMinUsd
     });
     if (liquidity.outcome === 'WAIT') {
+      if (!liquidity.reasons.includes('DETAIL_INTERVAL_SHORT')) {
+        this.states.set(key, { firstDetail: detail });
+      }
       return { outcome: 'WAIT', reasons: liquidity.reasons, pool: detail, liquidity };
     }
     if (liquidity.outcome === 'REJECT') {
@@ -419,23 +427,28 @@ export class FixedPoolQualificationService {
       return { outcome: 'WAIT', reasons: ['GMGN_FACTS_STALE'], pool: detail, trades, liquidity };
     }
     if (
-      info.poolCreatedAtMs === null ||
-      info.poolCreatedAtMs > finalAtMs ||
-      finalAtMs - info.poolCreatedAtMs > this.config.thresholds.poolAgeMaxSeconds * 1_000
+      info.poolCreatedAtMs === null || info.poolCreatedAtMs > finalAtMs
     ) {
       return this.reject(chain, token, 'POOL_AGE_OUT_OF_RANGE', { info: info.raw });
     }
     const activationReason = activationReasonFromCode(
       this.events.findFirstActivationReasonCode(chain, token)
     );
+    const reference = this.pools.setQualificationReference({
+      chain,
+      tokenAddress: token,
+      priceUsd: trades.decisionPriceUsd!,
+      atMs: trades.latestTradeAtMs!
+    });
     const eligibility: SendEligibilitySnapshot = Object.freeze({
       chain,
       tokenAddress: token,
       pool: detail,
-      decisionPriceUsd: trades.decisionPriceUsd!,
-      decisionTradeAtMs: trades.latestTradeAtMs!,
+      decisionPriceUsd: reference.qualificationReferencePriceUsd!,
+      decisionTradeAtMs: reference.qualificationReferenceAtMs!,
       firstSeenAtMs: current.firstSeenAtMs,
       sampledMaxGain: current.sampledMaxGain,
+      opportunityType: current.opportunityType ?? 'new_pool',
       security: securityDecision.normalized,
       trades,
       liquidity,
@@ -498,10 +511,8 @@ export class FixedPoolQualificationService {
             liquidity
           },
           thresholds: {
-            marketCapMinUsd: this.config.thresholds.marketCapMinUsd,
-            marketCapMaxUsd: this.config.thresholds.marketCapMaxUsd,
+            marketCapUsd: QUALIFICATION_POLICY.marketCapUsd,
             liquidityMinUsd: this.config.thresholds.liquidityMinUsd,
-            poolAgeMaxSeconds: this.config.thresholds.poolAgeMaxSeconds,
             security: gmgnThresholds(this.config),
             qualification: QUALIFICATION_POLICY
           },

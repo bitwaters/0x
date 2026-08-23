@@ -28,7 +28,9 @@ test('parses safe defaults without exposing provider secrets', () => {
   assert.equal(config.chains.sol, true);
   assert.equal(config.chains.bsc, true);
   assert.equal(config.telegram.enabled, false);
-  assert.equal(config.thresholds.marketCapMinUsd, 20_000);
+  assert.equal(config.thresholds.marketCapMinUsd, 10_000);
+  assert.equal(config.thresholds.marketCapMaxUsd, 300_000);
+  assert.deepEqual(config.qualificationPolicy.marketCapUsd, { min: 20_000, max: 300_000 });
   assert.equal(config.limits.coinGeckoRestRpm, 450);
   assert.equal(config.qualificationPolicy.tradeMinCount, 5);
   assert.deepEqual(config.sourcePolicy.gmgnTrendingFilters.bsc, [

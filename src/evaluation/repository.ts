@@ -31,7 +31,7 @@ export interface ValidationProgress {
   readonly validationMatured15m: number;
   readonly betaRequiredMatured15m: number;
   readonly totalDelivered: number;
-  readonly remainingTo: Readonly<Record<'20' | '50' | '100' | '200', number>>;
+  readonly remainingTo: Readonly<Record<'beta' | 'nextReport', number>>;
 }
 
 export interface DeliveredSignalSample {
@@ -180,41 +180,19 @@ export class EvaluationRepository {
         WHERE chain = ? AND delivery_stage = 'validation' AND validation_epoch = ?
       `)
       .get(chain, state.validationEpoch) as { count: number }).count;
-    const maturityRows = this.database
-      .prepare(`
-        SELECT s.validation_seq, p.scheduled_at_ms, p.status
-        FROM delivered_signal_samples s
-        JOIN signal_evaluation_points p ON p.sample_id = s.id
-        WHERE s.chain = ? AND s.delivery_stage = 'validation'
-          AND s.validation_epoch = ? AND p.horizon_seconds = ?
-          AND s.validation_seq <= ?
-        ORDER BY s.validation_seq
-      `)
-      .all(
-        chain,
-        state.validationEpoch,
-        EVALUATION_POLICY.betaMaturityHorizonSeconds,
-        EVALUATION_POLICY.betaMatureSamples
-      ) as unknown as Array<{
-        validation_seq: number;
-        scheduled_at_ms: number;
-        status: EvaluationStatus;
-      }>;
-    let validationMatured15m = 0;
-    for (const row of maturityRows) {
-      if (
-        row.validation_seq !== validationMatured15m + 1 ||
-        row.scheduled_at_ms > nowMs ||
-        !['COMPLETE', 'AMBIGUOUS', 'TERMINAL_NEGATIVE'].includes(row.status)
-      ) {
-        break;
-      }
-      validationMatured15m += 1;
-    }
+    const validationMatured15m = this.matureEvaluationCount(
+      chain,
+      state.validationEpoch,
+      nowMs
+    );
     const totalDelivered = (this.database
       .prepare('SELECT COUNT(*) AS count FROM delivered_signal_samples WHERE chain = ?')
       .get(chain) as { count: number }).count;
-    const remaining = (milestone: number) => Math.max(0, milestone - totalDelivered);
+    const nextReport = validationMatured15m < EVALUATION_POLICY.reportFirstCount
+      ? EVALUATION_POLICY.reportFirstCount
+      : EVALUATION_POLICY.reportFirstCount +
+        (Math.floor((validationMatured15m - EVALUATION_POLICY.reportFirstCount) /
+          EVALUATION_POLICY.reportStep) + 1) * EVALUATION_POLICY.reportStep;
     return {
       chain,
       state: state.state,
@@ -224,10 +202,8 @@ export class EvaluationRepository {
       betaRequiredMatured15m: EVALUATION_POLICY.betaMatureSamples,
       totalDelivered,
       remainingTo: {
-        '20': Math.max(0, EVALUATION_POLICY.betaMatureSamples - validationMatured15m),
-        '50': remaining(50),
-        '100': remaining(100),
-        '200': remaining(200)
+        beta: Math.max(0, EVALUATION_POLICY.betaMatureSamples - validationMatured15m),
+        nextReport: Math.max(0, nextReport - validationMatured15m)
       }
     };
   }
@@ -299,7 +275,7 @@ export class EvaluationRepository {
       const scheduledAtMs = input.receiptAtMs + horizonSeconds * 1_000;
       const nextAttemptAtMs =
         horizonSeconds === 10
-          ? scheduledAtMs + EVALUATION_POLICY.entryTradeMaxDelayMs
+          ? scheduledAtMs
           : scheduledAtMs;
       const details =
         horizonSeconds === 10
@@ -333,7 +309,6 @@ export class EvaluationRepository {
         `)
         .run(input.receiptAtMs, eligibility.chain);
     }
-    this.createDueReports(eligibility.chain, input.receiptAtMs);
     return this.findSample(sampleId)!;
   }
 
@@ -404,6 +379,7 @@ export class EvaluationRepository {
     readonly sellAtMs?: number;
     readonly observedAtMs: number;
     readonly facts?: unknown;
+    readonly result?: PathMetrics;
   }): void {
     this.database
       .prepare(`
@@ -421,7 +397,7 @@ export class EvaluationRepository {
         input.observedAtMs,
         input.point.sampleId
       );
-    this.completePoint(input.point, {
+    this.completePoint(input.point, input.result ?? {
       priceUsd: input.priceUsd,
       grossReturn: 0,
       mfe: 0,
@@ -620,33 +596,10 @@ export class EvaluationRepository {
   maybePromoteBeta(chain: Chain, observedAtMs: number): boolean {
     const state = this.chainState(chain);
     if (state.state !== 'VALIDATING') return false;
-    const rows = this.database
-      .prepare(`
-        SELECT s.validation_seq, p.status
-        FROM delivered_signal_samples s
-        JOIN signal_evaluation_points p ON p.sample_id = s.id
-        WHERE s.chain = ? AND s.delivery_stage = 'validation'
-          AND s.validation_epoch = ? AND p.horizon_seconds = ?
-          AND s.validation_seq <= ? AND p.scheduled_at_ms <= ?
-        ORDER BY s.validation_seq
-      `)
-      .all(
-        chain,
-        state.validationEpoch,
-        EVALUATION_POLICY.betaMaturityHorizonSeconds,
-        EVALUATION_POLICY.betaMatureSamples,
-        observedAtMs
-      ) as Array<{ validation_seq: number; status: EvaluationStatus }>;
-    if (rows.length !== EVALUATION_POLICY.betaMatureSamples) return false;
     if (
-      rows.some(
-        (row, index) =>
-          row.validation_seq !== index + 1 ||
-          !['COMPLETE', 'AMBIGUOUS', 'TERMINAL_NEGATIVE'].includes(row.status)
-      )
-    ) {
-      return false;
-    }
+      this.matureEvaluationCount(chain, state.validationEpoch, observedAtMs) <
+      EVALUATION_POLICY.betaMatureSamples
+    ) return false;
     this.database
       .prepare(`
         UPDATE chain_release_state
@@ -687,13 +640,21 @@ export class EvaluationRepository {
     return this.chainState(chain);
   }
 
-  liveReport(chain: Chain, nowMs: number): unknown {
+  liveReport(chain: Chain, nowMs: number, decisionRuleVersion?: string): unknown {
     const total = (this.database
-      .prepare('SELECT COUNT(*) AS count FROM delivered_signal_samples WHERE chain = ?')
-      .get(chain) as { count: number }).count;
+      .prepare(`
+        SELECT COUNT(*) AS count FROM delivered_signal_samples
+        WHERE chain = ? AND (? IS NULL OR decision_rule_version = ?)
+      `)
+      .get(
+        chain,
+        decisionRuleVersion ?? null,
+        decisionRuleVersion ?? null
+      ) as { count: number }).count;
     const bySegment = this.database
       .prepare(`
         SELECT s.decision_rule_version AS ruleVersion,
+               COALESCE(json_extract(s.snapshot_json, '$.eligibility.opportunityType'), 'legacy') AS opportunityType,
                s.delivery_stage AS deliveryStage,
                p.horizon_seconds AS horizonSeconds,
                COUNT(*) AS total,
@@ -705,21 +666,30 @@ export class EvaluationRepository {
                SUM(CASE WHEN p.scheduled_at_ms <= ?1 AND p.status = 'PENDING' THEN 1 ELSE 0 END) AS pendingDue,
                SUM(CASE WHEN p.scheduled_at_ms <= ?1 AND s.first_sell_trade_at_ms <= p.scheduled_at_ms THEN 1 ELSE 0 END) AS sellTradeObserved,
                AVG(CASE WHEN p.scheduled_at_ms <= ?1 THEN p.gross_return END) AS averageGrossReturn,
+               AVG(CASE WHEN p.scheduled_at_ms <= ?1 THEN p.mfe END) AS averageMfe,
+               AVG(CASE WHEN p.scheduled_at_ms <= ?1 THEN p.mae END) AS averageMae,
+               SUM(CASE WHEN p.scheduled_at_ms <= ?1 AND p.path_30_15 = 'UP_FIRST' THEN 1 ELSE 0 END) AS path30_15UpFirst,
+               SUM(CASE WHEN p.scheduled_at_ms <= ?1 AND p.path_30_15 = 'DOWN_FIRST' THEN 1 ELSE 0 END) AS path30_15DownFirst,
+               SUM(CASE WHEN p.scheduled_at_ms <= ?1 AND p.path_30_15 = 'AMBIGUOUS' THEN 1 ELSE 0 END) AS path30_15Ambiguous,
+               SUM(CASE WHEN p.scheduled_at_ms <= ?1 AND p.path_2x_30 = 'UP_FIRST' THEN 1 ELSE 0 END) AS path2x_30UpFirst,
+               SUM(CASE WHEN p.scheduled_at_ms <= ?1 AND p.path_2x_30 = 'DOWN_FIRST' THEN 1 ELSE 0 END) AS path2x_30DownFirst,
+               SUM(CASE WHEN p.scheduled_at_ms <= ?1 AND p.path_2x_30 = 'AMBIGUOUS' THEN 1 ELSE 0 END) AS path2x_30Ambiguous,
                AVG(CASE WHEN p.scheduled_at_ms <= ?1 THEN json_extract(p.details_json, '$.entryDelayMs') END) AS averageEntryDelayMs,
                AVG(CASE WHEN p.scheduled_at_ms <= ?1 THEN json_extract(p.details_json, '$.reserveUsd') END) AS averageReserveUsd,
                AVG(CASE WHEN p.scheduled_at_ms <= ?1 THEN json_extract(p.details_json, '$.security.buyTaxRatio') END) AS averageBuyTaxRatio,
                AVG(CASE WHEN p.scheduled_at_ms <= ?1 THEN json_extract(p.details_json, '$.security.sellTaxRatio') END) AS averageSellTaxRatio
         FROM delivered_signal_samples s
         JOIN signal_evaluation_points p ON p.sample_id = s.id
-        WHERE s.chain = ?2 AND p.horizon_seconds <> 90
-        GROUP BY s.decision_rule_version, s.delivery_stage, p.horizon_seconds
-        ORDER BY s.decision_rule_version, s.delivery_stage, p.horizon_seconds
+        WHERE s.chain = ?2 AND p.horizon_seconds IN (300, 900)
+          AND (?3 IS NULL OR s.decision_rule_version = ?3)
+        GROUP BY s.decision_rule_version, opportunityType, s.delivery_stage, p.horizon_seconds
+        ORDER BY s.decision_rule_version, opportunityType, s.delivery_stage, p.horizon_seconds
       `)
-      .all(nowMs, chain) as unknown as Array<Record<string, number | string>>;
+      .all(nowMs, chain, decisionRuleVersion ?? null) as unknown as Array<Record<string, number | string>>;
     return {
       chain,
       totalDelivered: total,
-      statement: '20条仅验证技术链路；毛价格变化不代表可执行净利润。',
+      statement: '5条仅验证技术链路；毛价格变化不代表可执行净利润。',
       segments: bySegment.map((segment) => {
         const due = Number(segment.due);
         const covered = Number(segment.complete) + Number(segment.terminalNegative);
@@ -732,21 +702,33 @@ export class EvaluationRepository {
     };
   }
 
-  private createDueReports(chain: Chain, observedAtMs: number): void {
-    const count = (this.database
-      .prepare('SELECT COUNT(*) AS count FROM delivered_signal_samples WHERE chain = ?')
-      .get(chain) as { count: number }).count;
-    const milestone =
-      EVALUATION_POLICY.milestoneCounts.includes(count as 50 | 100 | 200) ||
-      (count > 200 && count % EVALUATION_POLICY.milestoneStepAfter200 === 0);
-    if (milestone) this.insertReport(chain, 'MILESTONE', count, observedAtMs);
-    if (count % EVALUATION_POLICY.parameterReviewStep === 0) {
-      this.insertReport(chain, 'PARAMETER_REVIEW', count, observedAtMs);
+  createDueReports(chain: Chain, observedAtMs: number): void {
+    const versions = this.database.prepare(`
+      SELECT DISTINCT decision_rule_version AS version
+      FROM delivered_signal_samples WHERE chain = ?
+    `).all(chain) as Array<{ version: string }>;
+    for (const { version } of versions) {
+      const count = this.matureEvaluationCount(chain, null, observedAtMs, version);
+      const latest = this.database.prepare(`
+        SELECT MAX(boundary_count) AS boundary
+        FROM evaluation_reports
+        WHERE chain = ? AND decision_rule_version = ? AND kind = 'PARAMETER_REVIEW'
+      `).get(chain, version) as { boundary: number | null };
+      for (
+        let boundary = latest.boundary === null
+          ? EVALUATION_POLICY.reportFirstCount
+          : latest.boundary + EVALUATION_POLICY.reportStep;
+        boundary <= count;
+        boundary += EVALUATION_POLICY.reportStep
+      ) {
+        this.insertReport(chain, version, 'PARAMETER_REVIEW', boundary, observedAtMs);
+      }
     }
   }
 
   private insertReport(
     chain: Chain,
+    decisionRuleVersion: string,
     kind: 'MILESTONE' | 'PARAMETER_REVIEW',
     count: number,
     observedAtMs: number
@@ -754,21 +736,51 @@ export class EvaluationRepository {
     this.database
       .prepare(`
         INSERT INTO evaluation_reports(
-          chain, kind, boundary_count, generated_at_ms, snapshot_json
-        ) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(chain, kind, boundary_count) DO NOTHING
+          chain, decision_rule_version, kind, boundary_count, generated_at_ms, snapshot_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chain, decision_rule_version, kind, boundary_count) DO NOTHING
       `)
       .run(
         chain,
+        decisionRuleVersion,
         kind,
         count,
         observedAtMs,
         stableJsonStringify({
-          report: this.liveReport(chain, observedAtMs),
+          report: this.liveReport(chain, observedAtMs, decisionRuleVersion),
           ...(kind === 'PARAMETER_REVIEW'
             ? { reviewPolicy: { maximumParameterFamiliesPerChange: 1 } }
             : {})
         })
       );
+  }
+
+  private matureEvaluationCount(
+    chain: Chain,
+    validationEpoch: number | null,
+    observedAtMs: number,
+    decisionRuleVersion?: string
+  ): number {
+    const row = this.database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM delivered_signal_samples s
+      JOIN signal_evaluation_points p
+        ON p.sample_id = s.id AND p.horizon_seconds = ?1
+      WHERE s.chain = ?2
+        AND s.entry_price_usd IS NOT NULL AND s.entry_trade_at_ms IS NOT NULL
+        AND p.scheduled_at_ms <= ?3
+        AND p.status IN ('COMPLETE', 'AMBIGUOUS', 'TERMINAL_NEGATIVE')
+        AND (?4 IS NULL OR (
+          s.delivery_stage = 'validation' AND s.validation_epoch = ?4
+        ))
+        AND (?5 IS NULL OR s.decision_rule_version = ?5)
+    `).get(
+      EVALUATION_POLICY.betaMaturityHorizonSeconds,
+      chain,
+      observedAtMs,
+      validationEpoch,
+      decisionRuleVersion ?? null
+    ) as { count: number };
+    return row.count;
   }
 }

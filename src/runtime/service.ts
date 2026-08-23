@@ -3,6 +3,7 @@ import { getConfiguredSecrets } from '../config.js';
 import type { SqliteDatabase } from '../db/database.js';
 import {
   CandidateRepository,
+  OutboxRepository,
   PoolBindingRepository,
   QualificationEventRepository,
   RankSnapshotRepository,
@@ -10,6 +11,7 @@ import {
 } from '../db/repositories.js';
 import { CandidateDiscoveryEngine } from '../discovery/engine.js';
 import { DiscoveryPoller } from '../discovery/poller.js';
+import { DISCOVERY_POLICY } from '../discovery/policy.js';
 import { EvaluationService, type EvaluationCoinGeckoSource, type EvaluationGmgnSource } from '../evaluation/service.js';
 import { CoinGeckoClient } from '../providers/coingecko.js';
 import {
@@ -74,6 +76,7 @@ const disabledTelegram: TelegramTransportLike = {
 export class BotRuntime {
   private readonly candidates: CandidateRepository;
   private readonly pools: PoolBindingRepository;
+  private readonly outbox: OutboxRepository;
   private readonly rankSnapshots: RankSnapshotRepository;
   private readonly qualificationEvents: QualificationEventRepository;
   private readonly qualification: FixedPoolQualificationService;
@@ -83,7 +86,7 @@ export class BotRuntime {
   private readonly sockets: G2SocketManager;
   private readonly abortController = new AbortController();
   private readonly qualificationLastAt = new Map<string, number>();
-  private readonly radarRenderedStatus = new Map<string, CandidateRecord['status']>();
+  private readonly radarLastAt = new Map<string, number>();
   private readonly signalPreviewed = new Set<string>();
   private readonly dirtyPools = new Map<string, { chain: Chain; poolAddress: string }>();
   private readonly timers: Array<ReturnType<typeof setInterval>> = [];
@@ -114,6 +117,7 @@ export class BotRuntime {
     );
     this.candidates = new CandidateRepository(database);
     this.pools = new PoolBindingRepository(database);
+    this.outbox = new OutboxRepository(database);
     this.rankSnapshots = new RankSnapshotRepository(database);
     this.qualificationEvents = new QualificationEventRepository(database);
     this.evaluation = new EvaluationService(database, config, coinGecko, gmgn, this.now);
@@ -257,7 +261,11 @@ export class BotRuntime {
       .listActionable()
       .filter((candidate) => this.config.chains[candidate.chain]);
     await Promise.all([
-      this.processRadar(actionable),
+      this.processRadar(
+        this.candidates
+          .listRadarCandidates()
+          .filter((candidate) => this.config.chains[candidate.chain])
+      ),
       this.processQualification(actionable)
     ]);
   }
@@ -285,15 +293,58 @@ export class BotRuntime {
   }
 
   private async processRadar(actionable: readonly CandidateRecord[]): Promise<void> {
-    const candidate = actionable.find((item) => {
-      if (!['RADAR', 'PREHEAT'].includes(item.status)) return false;
-      const key = `${item.chain}:${item.tokenAddress}`;
-      return this.radarRenderedStatus.get(key) !== item.status;
-    });
-    if (candidate === undefined) return;
-    if (!this.config.chains[candidate.chain]) return;
-    const key = `${candidate.chain}:${candidate.tokenAddress}`;
-    const latestRank = this.rankSnapshots.findLatest(candidate.chain, candidate.tokenAddress);
+    const nowMs = this.now();
+    for (const candidate of actionable) {
+      const key = `${candidate.chain}:${candidate.tokenAddress}`;
+      const lastAt = this.radarLastAt.get(key);
+      if (lastAt !== undefined && nowMs - lastAt < QUALIFICATION_REFRESH_MS) continue;
+      this.radarLastAt.set(key, nowMs);
+      const existing = this.outbox.find(candidate.chain, candidate.tokenAddress, 'radar');
+      const latest = this.rankSnapshots.findLatest(candidate.chain, candidate.tokenAddress);
+      const currentFetchAt = this.rankSnapshots.findLatestSuccessfulFetchAt(candidate.chain, '1m');
+      const latestFresh =
+        latest !== undefined &&
+        latest.fetchedAtMs === currentFetchAt &&
+        nowMs - latest.fetchedAtMs <= DISCOVERY_POLICY.snapshotMaxAgeMs['1m'];
+      const bondingPublic =
+        candidate.status === 'RADAR' &&
+        latestFresh &&
+        latest.rank <= DISCOVERY_POLICY.bondingRadarRankMax &&
+          latest.marketCapUsd >= DISCOVERY_POLICY.bondingRadarMarketCapUsd.min &&
+          latest.marketCapUsd <= DISCOVERY_POLICY.bondingRadarMarketCapUsd.max;
+      const realPoolPublic =
+        ['PREHEAT', 'POOL_BOUND', 'MONITORING'].includes(candidate.status) &&
+        latestFresh &&
+        latest.rank <= DISCOVERY_POLICY.realPoolRankMax &&
+        latest.marketCapUsd >= DISCOVERY_POLICY.realPoolMarketCapUsd.min &&
+        latest.marketCapUsd <= DISCOVERY_POLICY.realPoolMarketCapUsd.max &&
+        latest.liquidityUsd !== null &&
+        latest.liquidityUsd >= this.config.thresholds.liquidityMinUsd;
+      const stage: RadarMessageSnapshot['stage'] | undefined =
+        candidate.status === 'SIGNAL_SENT'
+          ? 'qualified'
+          : candidate.status === 'EXPIRED'
+            ? 'expired'
+            : candidate.status === 'REJECTED'
+              ? 'rejected'
+              : realPoolPublic
+                ? 'real_pool'
+                : bondingPublic
+                  ? 'bonding'
+                  : existing !== undefined
+                    ? 'heat_wait'
+                    : undefined;
+      if (stage === undefined) continue;
+      await this.deliverRadar(candidate, latestFresh ? latest : undefined, existing?.payload, stage);
+    }
+  }
+
+  private async deliverRadar(
+    candidate: CandidateRecord,
+    latestRank: ReturnType<RankSnapshotRepository['findLatest']>,
+    existingPayload: unknown,
+    stage: RadarMessageSnapshot['stage']
+  ): Promise<void> {
     const raw =
       latestRank?.raw !== null && typeof latestRank?.raw === 'object' && !Array.isArray(latestRank.raw)
         ? (latestRank.raw as Readonly<Record<string, unknown>>)
@@ -306,14 +357,17 @@ export class BotRuntime {
     );
     const name = raw?.name;
     const symbol = raw?.symbol;
+    const previous =
+      existingPayload !== null && typeof existingPayload === 'object' && !Array.isArray(existingPayload)
+        ? (existingPayload as { readonly snapshot?: RadarMessageSnapshot }).snapshot
+        : undefined;
     const snapshot: RadarMessageSnapshot = {
       chain: candidate.chain,
       tokenAddress: candidate.tokenAddress,
       firstSeenAtMs: candidate.firstSeenAtMs,
       marketCapUsd: candidate.firstSeenMarketCapUsd,
       sampledMaxGain: candidate.sampledMaxGain,
-      status: candidate.status as 'RADAR' | 'PREHEAT',
-      renderedAtMs: this.now(),
+      stage,
       ...(latestRank !== undefined &&
       typeof name === 'string' &&
       typeof symbol === 'string' &&
@@ -328,17 +382,15 @@ export class BotRuntime {
               activationReason
             }
           }
-        : {})
+        : previous?.presentation === undefined
+          ? {}
+          : { presentation: previous.presentation })
     };
     if (!this.config.telegram.enabled) {
       this.emit({ event: 'radar_preview_rendered', chain: candidate.chain, text: renderRadarMessage(snapshot) });
-      this.radarRenderedStatus.set(key, candidate.status);
       return;
     }
     const result = await this.delivery.sendRadar(snapshot, this.abortController.signal);
-    if (result.outcome !== 'RETRYABLE_FAILURE') {
-      this.radarRenderedStatus.set(key, candidate.status);
-    }
     this.emit({ event: 'radar_delivery', chain: candidate.chain, outcome: result.outcome });
   }
 

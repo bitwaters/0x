@@ -28,6 +28,7 @@ export interface SendEligibilitySnapshot {
   readonly decisionTradeAtMs: number;
   readonly firstSeenAtMs: number;
   readonly sampledMaxGain: number;
+  readonly opportunityType: 'new_pool' | 'revival';
   readonly security: Readonly<Record<string, number | boolean>>;
   readonly trades: TradeWindowDecision;
   readonly liquidity: LiquidityDecision;

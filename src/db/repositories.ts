@@ -45,6 +45,13 @@ export interface CandidateRecord {
   readonly firstSeenPriceUsd: number;
   readonly highPriceUsd: number;
   readonly sampledMaxGain: number;
+  readonly opportunityType: 'new_pool' | 'revival' | null;
+  readonly activationAtMs: number | null;
+  readonly activationPriceUsd: number | null;
+  readonly activationHighPriceUsd: number | null;
+  readonly activationSampledMaxGain: number | null;
+  readonly activationRuleVersion: string | null;
+  readonly legacyReopenedAtMs: number | null;
   readonly firstSeenRank: number;
   readonly firstSeenMarketCapUsd: number;
   readonly firstSeenLiquidityUsd: number | null;
@@ -62,6 +69,13 @@ interface CandidateRow {
   first_seen_price_usd: number;
   high_price_usd: number;
   sampled_max_gain: number;
+  opportunity_type: 'new_pool' | 'revival' | null;
+  activation_at_ms: number | null;
+  activation_price_usd: number | null;
+  activation_high_price_usd: number | null;
+  activation_sampled_max_gain: number | null;
+  activation_rule_version: string | null;
+  legacy_reopened_at_ms: number | null;
   first_seen_rank: number;
   first_seen_market_cap_usd: number;
   first_seen_liquidity_usd: number | null;
@@ -80,6 +94,13 @@ function toCandidate(row: CandidateRow): CandidateRecord {
     firstSeenPriceUsd: row.first_seen_price_usd,
     highPriceUsd: row.high_price_usd,
     sampledMaxGain: row.sampled_max_gain,
+    opportunityType: row.opportunity_type,
+    activationAtMs: row.activation_at_ms,
+    activationPriceUsd: row.activation_price_usd,
+    activationHighPriceUsd: row.activation_high_price_usd,
+    activationSampledMaxGain: row.activation_sampled_max_gain,
+    activationRuleVersion: row.activation_rule_version,
+    legacyReopenedAtMs: row.legacy_reopened_at_ms,
     firstSeenRank: row.first_seen_rank,
     firstSeenMarketCapUsd: row.first_seen_market_cap_usd,
     firstSeenLiquidityUsd: row.first_seen_liquidity_usd,
@@ -164,6 +185,22 @@ export class CandidateRepository {
     return rows.map(toCandidate);
   }
 
+  listRadarCandidates(): readonly CandidateRecord[] {
+    const rows = this.database
+      .prepare(`
+        SELECT c.* FROM candidates c
+        WHERE c.status IN ('RADAR', 'PREHEAT', 'POOL_BOUND', 'MONITORING')
+          OR EXISTS (
+            SELECT 1 FROM message_outbox o
+            WHERE o.chain = c.chain AND o.token_address = c.token_address
+              AND o.message_kind = 'radar'
+          )
+        ORDER BY c.first_seen_at_ms, c.chain, c.token_address
+      `)
+      .all() as unknown as CandidateRow[];
+    return rows.map(toCandidate);
+  }
+
   find(chain: Chain, tokenAddress: string): CandidateRecord | undefined {
     const normalizedAddress = normalizeAddress(chain, tokenAddress);
     const row = this.database
@@ -235,15 +272,23 @@ export class CandidateRepository {
     if (candidate === undefined) throw new Error('candidate not found');
     const highPrice = Math.max(candidate.highPriceUsd, input.observedPriceUsd);
     const sampledMaxGain = highPrice / candidate.firstSeenPriceUsd - 1;
+    const activationHighPrice = candidate.activationPriceUsd === null
+      ? null
+      : Math.max(candidate.activationHighPriceUsd ?? candidate.activationPriceUsd, input.observedPriceUsd);
+    const activationSampledMaxGain = activationHighPrice === null || candidate.activationPriceUsd === null
+      ? null
+      : activationHighPrice / candidate.activationPriceUsd - 1;
     const shouldReject =
       !TERMINAL_STATUSES.has(candidate.status) &&
-      highPrice > candidate.firstSeenPriceUsd * (1 + input.maxGainRatio);
+      candidate.activationPriceUsd !== null &&
+      activationHighPrice! > candidate.activationPriceUsd * (1 + input.maxGainRatio);
     const normalizedAddress = normalizeAddress(input.chain, input.tokenAddress);
 
     this.database
       .prepare(`
           UPDATE candidates
           SET high_price_usd = ?, sampled_max_gain = ?,
+              activation_high_price_usd = ?, activation_sampled_max_gain = ?,
               status = CASE WHEN ? THEN 'REJECTED' ELSE status END,
               terminal_reason = CASE WHEN ? THEN 'CHASE_LIMIT_EXCEEDED' ELSE terminal_reason END,
               decision_rule_version = CASE WHEN ? THEN ? ELSE decision_rule_version END,
@@ -253,6 +298,8 @@ export class CandidateRepository {
       .run(
           highPrice,
           sampledMaxGain,
+          activationHighPrice,
+          activationSampledMaxGain,
           shouldReject ? 1 : 0,
           shouldReject ? 1 : 0,
           shouldReject ? 1 : 0,
@@ -273,16 +320,151 @@ export class CandidateRepository {
           observedAtMs: input.observedAtMs,
           raw: input.raw,
           normalized: {
-            firstSeenPriceUsd: candidate.firstSeenPriceUsd,
+            activationPriceUsd: candidate.activationPriceUsd,
             observedPriceUsd: input.observedPriceUsd,
             highPriceUsd: highPrice,
-            sampledMaxGain
+            activationSampledMaxGain
           },
           thresholds: { maxGainRatio: input.maxGainRatio },
           decisionRuleVersion: input.decisionRuleVersion
       });
     }
     return this.find(input.chain, normalizedAddress)!;
+  }
+
+  activate(input: {
+    readonly chain: Chain;
+    readonly tokenAddress: string;
+    readonly opportunityType: 'new_pool' | 'revival';
+    readonly priceUsd: number;
+    readonly ruleVersion: string;
+    readonly atMs: number;
+  }): CandidateRecord {
+    requireFinitePositive(input.priceUsd, 'priceUsd');
+    const token = normalizeAddress(input.chain, input.tokenAddress);
+    const result = this.database.prepare(`
+      UPDATE candidates
+      SET opportunity_type = ?, activation_at_ms = ?, activation_price_usd = ?,
+          activation_high_price_usd = ?, activation_sampled_max_gain = 0,
+          activation_rule_version = ?, decision_rule_version = ?, updated_at_ms = ?
+      WHERE chain = ? AND token_address = ? AND activation_at_ms IS NULL
+        AND status IN ('DISCOVERED', 'RADAR')
+    `).run(
+      input.opportunityType,
+      input.atMs,
+      input.priceUsd,
+      input.priceUsd,
+      input.ruleVersion,
+      input.ruleVersion,
+      input.atMs,
+      input.chain,
+      token
+    );
+    if (result.changes !== 1) {
+      const existing = this.find(input.chain, token);
+      if (existing?.activationAtMs === null || existing === undefined) {
+        throw new Error('candidate is not activatable');
+      }
+    }
+    return this.find(input.chain, token)!;
+  }
+
+  reopenEligibleLegacy(ruleVersion: string, atMs = Date.now()): number {
+    return withTransaction(this.database, () => {
+      const activeRows = this.database.prepare(`
+        SELECT chain, token_address, status
+        FROM candidates
+        WHERE activation_at_ms IS NULL AND legacy_reopened_at_ms IS NULL
+          AND status IN ('PREHEAT', 'POOL_BOUND', 'MONITORING')
+          AND NOT EXISTS (
+            SELECT 1 FROM message_outbox o
+            WHERE o.chain = candidates.chain AND o.token_address = candidates.token_address
+              AND o.message_kind = 'signal'
+              AND o.status IN ('SENDING', 'SENT', 'UNCERTAIN')
+          )
+      `).all() as Array<{
+        chain: Chain;
+        token_address: string;
+        status: CandidateStatus;
+      }>;
+      const rows = this.database.prepare(`
+        SELECT chain, token_address, terminal_reason
+        FROM candidates c
+        WHERE c.status = 'REJECTED' AND c.legacy_reopened_at_ms IS NULL
+          AND c.activation_at_ms IS NULL
+          AND (
+            c.terminal_reason IN ('POOL_TOO_OLD', 'POOL_AGE_OUT_OF_RANGE')
+            OR c.terminal_reason = 'CHASE_LIMIT_EXCEEDED'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM message_outbox o
+            WHERE o.chain = c.chain AND o.token_address = c.token_address
+              AND o.message_kind = 'signal'
+              AND o.status IN ('SENDING', 'SENT', 'UNCERTAIN')
+          )
+      `).all() as Array<{
+        chain: Chain;
+        token_address: string;
+        terminal_reason: string;
+      }>;
+      const events = new QualificationEventRepository(this.database);
+      for (const row of activeRows) {
+        this.database.prepare(`
+          DELETE FROM pool_bindings WHERE chain = ? AND token_address = ?
+        `).run(row.chain, row.token_address);
+        this.database.prepare(`
+          UPDATE candidates
+          SET status = 'DISCOVERED', terminal_reason = NULL,
+              decision_rule_version = NULL, qualification_started_at_ms = NULL,
+              legacy_reopened_at_ms = ?, updated_at_ms = ?
+          WHERE chain = ? AND token_address = ?
+        `).run(atMs, atMs, row.chain, row.token_address);
+        events.record({
+          chain: row.chain,
+          tokenAddress: row.token_address,
+          stage: 'legacy_reopen',
+          outcome: 'PASS',
+          reasonCode: 'LEGACY_ACTIVE_RESET',
+          source: 'system',
+          observedAtMs: atMs,
+          raw: { originalStatus: row.status },
+          normalized: { reopenedStatus: 'DISCOVERED' },
+          thresholds: { requiresFreshActivation: true },
+          decisionRuleVersion: ruleVersion
+        });
+      }
+      for (const row of rows) {
+        this.database.prepare(`
+          DELETE FROM pool_bindings WHERE chain = ? AND token_address = ?
+        `).run(row.chain, row.token_address);
+        this.database.prepare(`
+          UPDATE candidates
+          SET status = 'DISCOVERED', terminal_reason = NULL,
+              decision_rule_version = NULL, qualification_started_at_ms = NULL,
+              opportunity_type = NULL, activation_at_ms = NULL,
+              activation_price_usd = NULL, activation_high_price_usd = NULL,
+              activation_sampled_max_gain = NULL, activation_rule_version = NULL,
+              legacy_reopened_at_ms = ?, updated_at_ms = ?
+          WHERE chain = ? AND token_address = ?
+        `).run(atMs, atMs, row.chain, row.token_address);
+        events.record({
+          chain: row.chain,
+          tokenAddress: row.token_address,
+          stage: 'legacy_reopen',
+          outcome: 'PASS',
+          reasonCode: 'LEGACY_TERMINAL_REOPENED',
+          source: 'system',
+          observedAtMs: atMs,
+          raw: { originalReason: row.terminal_reason },
+          normalized: { reopenedStatus: 'DISCOVERED' },
+          thresholds: { eligibleReasons: [
+            'POOL_TOO_OLD', 'POOL_AGE_OUT_OF_RANGE', 'CHASE_LIMIT_EXCEEDED'
+          ] },
+          decisionRuleVersion: ruleVersion
+        });
+      }
+      return activeRows.length + rows.length;
+    });
   }
 
   transition(
@@ -480,6 +662,17 @@ export class RankSnapshotRepository {
           raw: JSON.parse(row.raw_json) as unknown
         };
   }
+
+  findLatestSuccessfulFetchAt(chain: Chain, interval: '1m' | '5m'): number | undefined {
+    const row = this.database.prepare(`
+      SELECT fetched_at_ms
+      FROM rank_snapshot_fetches
+      WHERE chain = ? AND interval = ?
+      ORDER BY fetched_at_ms DESC
+      LIMIT 1
+    `).get(chain, interval) as { fetched_at_ms: number } | undefined;
+    return row?.fetched_at_ms;
+  }
 }
 
 export class RankSnapshotFetchRepository {
@@ -518,6 +711,8 @@ export interface PoolBindingRecord {
   readonly candidateSide: 'base' | 'quote';
   readonly counterTokenAddress: string;
   readonly boundAtMs: number;
+  readonly qualificationReferencePriceUsd: number | null;
+  readonly qualificationReferenceAtMs: number | null;
 }
 
 export class PoolBindingRepository {
@@ -528,7 +723,8 @@ export class PoolBindingRepository {
     const row = this.database
       .prepare(`
         SELECT chain, token_address, pool_address, candidate_side,
-               counter_token_address, bound_at_ms
+               counter_token_address, bound_at_ms,
+               qualification_reference_price_usd, qualification_reference_at_ms
         FROM pool_bindings WHERE chain = ? AND token_address = ?
       `)
       .get(chain, normalizedToken) as
@@ -539,6 +735,8 @@ export class PoolBindingRepository {
           candidate_side: 'base' | 'quote';
           counter_token_address: string;
           bound_at_ms: number;
+          qualification_reference_price_usd: number | null;
+          qualification_reference_at_ms: number | null;
         }
       | undefined;
     return row === undefined
@@ -549,15 +747,39 @@ export class PoolBindingRepository {
           poolAddress: row.pool_address,
           candidateSide: row.candidate_side,
           counterTokenAddress: row.counter_token_address,
-          boundAtMs: row.bound_at_ms
+          boundAtMs: row.bound_at_ms,
+          qualificationReferencePriceUsd: row.qualification_reference_price_usd,
+          qualificationReferenceAtMs: row.qualification_reference_at_ms
         };
+  }
+
+  setQualificationReference(input: {
+    readonly chain: Chain;
+    readonly tokenAddress: string;
+    readonly priceUsd: number;
+    readonly atMs: number;
+  }): PoolBindingRecord {
+    requireFinitePositive(input.priceUsd, 'priceUsd');
+    const token = normalizeAddress(input.chain, input.tokenAddress);
+    this.database.prepare(`
+      UPDATE pool_bindings
+      SET qualification_reference_price_usd = ?, qualification_reference_at_ms = ?
+      WHERE chain = ? AND token_address = ?
+        AND qualification_reference_price_usd IS NULL
+    `).run(input.priceUsd, input.atMs, input.chain, token);
+    const binding = this.find(input.chain, token);
+    if (binding === undefined || binding.qualificationReferencePriceUsd === null) {
+      throw new Error('pool binding reference price could not be persisted');
+    }
+    return binding;
   }
 
   findActive(): readonly PoolBindingRecord[] {
     const rows = this.database
       .prepare(`
         SELECT p.chain, p.token_address, p.pool_address, p.candidate_side,
-               p.counter_token_address, p.bound_at_ms
+               p.counter_token_address, p.bound_at_ms,
+               p.qualification_reference_price_usd, p.qualification_reference_at_ms
         FROM pool_bindings p
         JOIN candidates c
           ON c.chain = p.chain AND c.token_address = p.token_address
@@ -571,6 +793,8 @@ export class PoolBindingRepository {
         candidate_side: 'base' | 'quote';
         counter_token_address: string;
         bound_at_ms: number;
+        qualification_reference_price_usd: number | null;
+        qualification_reference_at_ms: number | null;
       }>;
     return rows.map((row) => ({
       chain: row.chain,
@@ -578,7 +802,9 @@ export class PoolBindingRepository {
       poolAddress: row.pool_address,
       candidateSide: row.candidate_side,
       counterTokenAddress: row.counter_token_address,
-      boundAtMs: row.bound_at_ms
+      boundAtMs: row.bound_at_ms,
+      qualificationReferencePriceUsd: row.qualification_reference_price_usd,
+      qualificationReferenceAtMs: row.qualification_reference_at_ms
     }));
   }
 
@@ -587,7 +813,8 @@ export class PoolBindingRepository {
     const rows = this.database
       .prepare(`
         SELECT chain, token_address, pool_address, candidate_side,
-               counter_token_address, bound_at_ms
+               counter_token_address, bound_at_ms,
+               qualification_reference_price_usd, qualification_reference_at_ms
         FROM pool_bindings
         WHERE chain = ? AND pool_address = ?
         ORDER BY token_address
@@ -599,6 +826,8 @@ export class PoolBindingRepository {
         candidate_side: 'base' | 'quote';
         counter_token_address: string;
         bound_at_ms: number;
+        qualification_reference_price_usd: number | null;
+        qualification_reference_at_ms: number | null;
       }>;
     return rows.map((row) => ({
       chain: row.chain,
@@ -606,7 +835,9 @@ export class PoolBindingRepository {
       poolAddress: row.pool_address,
       candidateSide: row.candidate_side,
       counterTokenAddress: row.counter_token_address,
-      boundAtMs: row.bound_at_ms
+      boundAtMs: row.bound_at_ms,
+      qualificationReferencePriceUsd: row.qualification_reference_price_usd,
+      qualificationReferenceAtMs: row.qualification_reference_at_ms
     }));
   }
 
@@ -764,6 +995,7 @@ export interface OutboxRecord {
   readonly receiptAtMs: number | null;
   readonly telegramMessageId: string | null;
   readonly lastError: string | null;
+  readonly appliedPayloadHash: string | null;
 }
 
 interface OutboxRow {
@@ -779,6 +1011,7 @@ interface OutboxRow {
   receipt_at_ms: number | null;
   telegram_message_id: string | null;
   last_error: string | null;
+  applied_payload_hash: string | null;
 }
 
 function toOutbox(row: OutboxRow): OutboxRecord {
@@ -794,7 +1027,8 @@ function toOutbox(row: OutboxRow): OutboxRecord {
     sendRequestedAtMs: row.send_requested_at_ms,
     receiptAtMs: row.receipt_at_ms,
     telegramMessageId: row.telegram_message_id,
-    lastError: row.last_error
+    lastError: row.last_error,
+    appliedPayloadHash: row.applied_payload_hash
   };
 }
 
@@ -906,6 +1140,48 @@ export class OutboxRepository {
       `)
       .run(stableJsonStringify(payload), atMs, id);
     if (result.changes !== 1) throw new Error('outbox record is not pending');
+    return this.findById(id)!;
+  }
+
+  updateRadarPayload(id: number, payload: unknown, atMs = Date.now()): OutboxRecord {
+    const payloadJson = stableJsonStringify(payload);
+    const result = this.database.prepare(`
+      UPDATE message_outbox
+      SET attempt_count = CASE WHEN payload_json <> ? THEN 0 ELSE attempt_count END,
+          last_error = CASE WHEN payload_json <> ? THEN NULL ELSE last_error END,
+          payload_json = ?, updated_at_ms = ?
+      WHERE id = ? AND message_kind = 'radar' AND status = 'SENT'
+    `).run(payloadJson, payloadJson, payloadJson, atMs, id);
+    if (result.changes !== 1) throw new Error('radar outbox is not editable');
+    return this.findById(id)!;
+  }
+
+  claimRadarEdit(id: number, atMs = Date.now(), maximumAttempts = 3): boolean {
+    const result = this.database.prepare(`
+      UPDATE message_outbox
+      SET attempt_count = attempt_count + 1, updated_at_ms = ?
+      WHERE id = ? AND message_kind = 'radar' AND status = 'SENT'
+        AND attempt_count < ?
+    `).run(atMs, id, maximumAttempts);
+    return result.changes === 1;
+  }
+
+  markRadarEditFailed(id: number, safeError: string, atMs = Date.now()): OutboxRecord {
+    const result = this.database.prepare(`
+      UPDATE message_outbox SET last_error = ?, updated_at_ms = ?
+      WHERE id = ? AND message_kind = 'radar' AND status = 'SENT'
+    `).run(safeError, atMs, id);
+    if (result.changes !== 1) throw new Error('radar edit failure cannot be recorded');
+    return this.findById(id)!;
+  }
+
+  markPayloadApplied(id: number, hash: string, atMs = Date.now()): OutboxRecord {
+    const result = this.database.prepare(`
+      UPDATE message_outbox
+      SET applied_payload_hash = ?, last_error = NULL, updated_at_ms = ?
+      WHERE id = ? AND message_kind = 'radar' AND status = 'SENT'
+    `).run(hash, atMs, id);
+    if (result.changes !== 1) throw new Error('radar payload cannot be marked applied');
     return this.findById(id)!;
   }
 

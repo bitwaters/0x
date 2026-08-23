@@ -23,6 +23,11 @@ interface RisingState {
   readonly count: number;
 }
 
+interface DualState {
+  readonly evaluatedAtMs: number;
+  readonly count: number;
+}
+
 export interface DiscoveryResult {
   readonly observed: number;
   readonly created: number;
@@ -42,6 +47,7 @@ export class CandidateDiscoveryEngine {
   private readonly events: QualificationEventRepository;
   private readonly latest = new Map<string, GmgnTrendingSnapshot>();
   private readonly rising = new Map<string, RisingState>();
+  private readonly dual = new Map<string, DualState>();
   private readonly lastResolutionAt = new Map<string, number>();
 
   constructor(
@@ -100,71 +106,90 @@ export class CandidateDiscoveryEngine {
     const activationWork: Array<{
       item: GmgnTrendingItem;
       reason: ActivationReason;
+      publicReady: boolean;
     }> = [];
 
-    withTransaction(this.database, () => {
-      this.snapshotFetches.insert({
-        chain: snapshot.chain,
-        interval: snapshot.interval,
-        fetchedAtMs: snapshot.fetchedAtMs,
-        itemCount: currentItems.size,
-        discoveryRuleVersion: this.config.ruleVersion
-      });
-      for (const item of currentItems.values()) {
-        const existing = this.candidates.find(snapshot.chain, item.tokenAddress);
-        const withinMarketCap = this.isWithinMarketCap(item.marketCapUsd);
-        if (existing === undefined && !withinMarketCap) continue;
-
-        const result =
-          existing === undefined
-            ? this.candidates.findOrCreate({
-                chain: snapshot.chain,
-                tokenAddress: item.tokenAddress,
-                firstSeenAtMs: snapshot.fetchedAtMs,
-                firstSeenPriceUsd: item.priceUsd,
-                firstSeenRank: item.rank,
-                firstSeenMarketCapUsd: item.marketCapUsd,
-                firstSeenLiquidityUsd: item.liquidityUsd,
-                discoveryRuleVersion: this.config.ruleVersion
-              })
-            : { candidate: existing, created: false };
-        if (result.created) created += 1;
-        observed += 1;
-        this.snapshots.insert({
+    const previousDual = new Map(this.dual);
+    try {
+      if (snapshot.interval === '1m') {
+        this.clearMissingDualCandidates(snapshot.chain, currentItems);
+      }
+      withTransaction(this.database, () => {
+        this.snapshotFetches.insert({
           chain: snapshot.chain,
           interval: snapshot.interval,
           fetchedAtMs: snapshot.fetchedAtMs,
-          tokenAddress: item.tokenAddress,
-          rank: item.rank,
-          priceUsd: item.priceUsd,
-          marketCapUsd: item.marketCapUsd,
-          liquidityUsd: item.liquidityUsd,
-          raw: item.raw
+          itemCount: currentItems.size,
+          discoveryRuleVersion: this.config.ruleVersion
         });
-        const candidate = this.candidates.updateHighWaterInTransaction({
-          chain: snapshot.chain,
-          tokenAddress: item.tokenAddress,
-          observedPriceUsd: item.priceUsd,
-          maxGainRatio: this.config.thresholds.maxObservedGainRatio,
-          decisionRuleVersion: this.config.ruleVersion,
-          observedAtMs: snapshot.fetchedAtMs,
-          raw: item.raw
-        });
-        if (!withinMarketCap || !['DISCOVERED', 'RADAR'].includes(candidate.status)) continue;
+        for (const item of currentItems.values()) {
+          const existing = this.candidates.find(snapshot.chain, item.tokenAddress);
+          const withinMarketCap = this.isWithinMarketCap(item.marketCapUsd);
+          if (existing === undefined && !withinMarketCap) continue;
 
-        const reason =
-          candidate.status === 'RADAR' && item.openAtMs !== null
-            ? 'RADAR_OPENED'
-            : this.dualRankActivation(normalizedSnapshot, item.tokenAddress, nowMs)
-              ? 'DUAL_RANK'
-              : risingUpdate.activated.has(item.tokenAddress)
-                ? 'THREE_RISING_1M'
-                : undefined;
-        if (reason !== undefined && this.canResolve(snapshot.chain, item.tokenAddress, nowMs)) {
-          activationWork.push({ item, reason });
+          const result =
+            existing === undefined
+              ? this.candidates.findOrCreate({
+                  chain: snapshot.chain,
+                  tokenAddress: item.tokenAddress,
+                  firstSeenAtMs: snapshot.fetchedAtMs,
+                  firstSeenPriceUsd: item.priceUsd,
+                  firstSeenRank: item.rank,
+                  firstSeenMarketCapUsd: item.marketCapUsd,
+                  firstSeenLiquidityUsd: item.liquidityUsd,
+                  discoveryRuleVersion: this.config.ruleVersion
+                })
+              : { candidate: existing, created: false };
+          if (result.created) created += 1;
+          observed += 1;
+          this.snapshots.insert({
+            chain: snapshot.chain,
+            interval: snapshot.interval,
+            fetchedAtMs: snapshot.fetchedAtMs,
+            tokenAddress: item.tokenAddress,
+            rank: item.rank,
+            priceUsd: item.priceUsd,
+            marketCapUsd: item.marketCapUsd,
+            liquidityUsd: item.liquidityUsd,
+            raw: item.raw
+          });
+          const candidate = this.candidates.updateHighWaterInTransaction({
+            chain: snapshot.chain,
+            tokenAddress: item.tokenAddress,
+            observedPriceUsd: item.priceUsd,
+            maxGainRatio: this.config.thresholds.maxObservedGainRatio,
+            decisionRuleVersion: this.config.ruleVersion,
+            observedAtMs: snapshot.fetchedAtMs,
+            raw: item.raw
+          });
+          if (!withinMarketCap || !['DISCOVERED', 'RADAR'].includes(candidate.status)) continue;
+
+          const dualCount = this.dualRankCount(
+            normalizedSnapshot,
+            item.tokenAddress,
+            nowMs
+          );
+          const publicReady =
+            dualCount >= DISCOVERY_POLICY.consecutiveDualSnapshotCount ||
+            risingUpdate.activated.has(item.tokenAddress);
+          const reason =
+            candidate.status === 'RADAR' && item.openAtMs !== null
+              ? 'RADAR_OPENED'
+              : dualCount >= 1
+                ? 'DUAL_RANK'
+                : risingUpdate.activated.has(item.tokenAddress)
+                  ? 'THREE_RISING_1M'
+                  : undefined;
+          if (reason !== undefined && this.canResolve(snapshot.chain, item.tokenAddress, nowMs)) {
+            activationWork.push({ item, reason, publicReady });
+          }
         }
-      }
-    });
+      });
+    } catch (error) {
+      this.dual.clear();
+      for (const [key, value] of previousDual) this.dual.set(key, value);
+      throw error;
+    }
     if (snapshot.interval === '1m') this.commitRising(snapshot.chain, risingUpdate.next);
     this.latest.set(latestKey, normalizedSnapshot);
     for (const { item } of activationWork) {
@@ -172,8 +197,15 @@ export class CandidateDiscoveryEngine {
     }
 
     const outcomes = await Promise.all(
-      activationWork.map(async ({ item, reason }) => {
-        await this.resolveActivation(snapshot.chain, item, reason, nowMs, signal);
+      activationWork.map(async ({ item, reason, publicReady }) => {
+        await this.resolveActivation(
+          snapshot.chain,
+          item,
+          reason,
+          publicReady,
+          nowMs,
+          signal
+        );
         return 1;
       })
     );
@@ -234,17 +266,29 @@ export class CandidateDiscoveryEngine {
     for (const [key, value] of next) this.rising.set(key, value);
   }
 
-  private dualRankActivation(
+  private clearMissingDualCandidates(
+    chain: Chain,
+    currentItems: ReadonlyMap<string, GmgnTrendingItem>
+  ): void {
+    const prefix = `${chain}:`;
+    for (const key of this.dual.keys()) {
+      if (key.startsWith(prefix) && !currentItems.has(key.slice(prefix.length))) {
+        this.dual.delete(key);
+      }
+    }
+  }
+
+  private dualRankCount(
     snapshot: GmgnTrendingSnapshot,
     tokenAddress: string,
     nowMs: number
-  ): boolean {
+  ): number {
     const otherInterval = snapshot.interval === '1m' ? '5m' : '1m';
     const other = this.latest.get(`${snapshot.chain}:${otherInterval}`);
-    if (other === undefined) return false;
+    if (other === undefined) return 0;
     const oneMinute = snapshot.interval === '1m' ? snapshot : other;
     const fiveMinute = snapshot.interval === '5m' ? snapshot : other;
-    return (
+    const qualifies = (
       nowMs >= oneMinute.fetchedAtMs &&
       nowMs >= fiveMinute.fetchedAtMs &&
       nowMs - oneMinute.fetchedAtMs <= DISCOVERY_POLICY.snapshotMaxAgeMs['1m'] &&
@@ -256,6 +300,20 @@ export class CandidateDiscoveryEngine {
           item.tokenAddress === tokenAddress && this.isWithinMarketCap(item.marketCapUsd)
       )
     );
+    const key = `${snapshot.chain}:${tokenAddress}`;
+    if (!qualifies) {
+      this.dual.delete(key);
+      return 0;
+    }
+    const evaluatedAtMs = oneMinute.fetchedAtMs;
+    const previous = this.dual.get(key);
+    if (previous?.evaluatedAtMs === evaluatedAtMs) return previous.count;
+    const next = {
+      evaluatedAtMs,
+      count: previous === undefined ? 1 : previous.count + 1
+    };
+    this.dual.set(key, next);
+    return next.count;
   }
 
   private canResolve(chain: Chain, tokenAddress: string, nowMs: number): boolean {
@@ -268,6 +326,7 @@ export class CandidateDiscoveryEngine {
     chain: Chain,
     item: GmgnTrendingItem,
     reason: ActivationReason,
+    publicReady: boolean,
     observedAtMs: number,
     signal?: AbortSignal
   ): Promise<void> {
@@ -310,8 +369,19 @@ export class CandidateDiscoveryEngine {
       return;
     }
 
+    const latestOneMinute = this.snapshots.findLatest(chain, item.tokenAddress, '1m');
+    if (
+      latestOneMinute === undefined ||
+      observedAtMs - latestOneMinute.fetchedAtMs > DISCOVERY_POLICY.snapshotMaxAgeMs['1m']
+    ) return;
+
     if (info.openAtMs === null || info.biggestPoolAddress === null) {
-      if (eligible.status === 'DISCOVERED') {
+      const bondingPublic =
+        publicReady &&
+        latestOneMinute.rank <= DISCOVERY_POLICY.bondingRadarRankMax &&
+        latestOneMinute.marketCapUsd >= DISCOVERY_POLICY.bondingRadarMarketCapUsd.min &&
+        latestOneMinute.marketCapUsd <= DISCOVERY_POLICY.bondingRadarMarketCapUsd.max;
+      if (eligible.status === 'DISCOVERED' && bondingPublic) {
         this.transitionWithEvent({
           chain,
           tokenAddress: item.tokenAddress,
@@ -330,14 +400,9 @@ export class CandidateDiscoveryEngine {
 
     const poolCreatedAtMs = info.poolCreatedAtMs;
     const poolAgeMs = poolCreatedAtMs === null ? null : observedAtMs - poolCreatedAtMs;
-    const rejection =
-      poolAgeMs === null || poolAgeMs < 0
-        ? 'POOL_TIME_INVALID'
-        : poolAgeMs > this.config.thresholds.poolAgeMaxSeconds * 1_000
-          ? 'POOL_TOO_OLD'
-          : info.liquidityUsd < this.config.thresholds.liquidityMinUsd
-            ? 'LIQUIDITY_TOO_LOW'
-            : undefined;
+    const rejection = poolAgeMs === null || poolAgeMs < 0
+      ? 'POOL_TIME_INVALID'
+      : undefined;
     if (rejection !== undefined) {
       this.transitionWithEvent({
         chain,
@@ -350,32 +415,75 @@ export class CandidateDiscoveryEngine {
         raw: info.raw,
         normalized: { liquidityUsd: info.liquidityUsd, poolAgeMs },
         thresholds: {
-          liquidityMinUsd: this.config.thresholds.liquidityMinUsd,
-          poolAgeMaxSeconds: this.config.thresholds.poolAgeMaxSeconds
+          liquidityMinUsd: this.config.thresholds.liquidityMinUsd
         }
       });
       return;
     }
+    if (
+      info.liquidityUsd === null ||
+      info.liquidityUsd < this.config.thresholds.liquidityMinUsd
+    ) {
+      this.events.record({
+        chain,
+        tokenAddress: item.tokenAddress,
+        stage: 'real_pool_range',
+        outcome: 'WAIT',
+        reasonCode: 'LIQUIDITY_TOO_LOW',
+        source: 'gmgn',
+        observedAtMs,
+        raw: info.raw,
+        normalized: { liquidityUsd: info.liquidityUsd, poolAgeMs },
+        thresholds: { liquidityMinUsd: this.config.thresholds.liquidityMinUsd },
+        decisionRuleVersion: this.config.ruleVersion
+      });
+      return;
+    }
 
-    this.transitionWithEvent({
-      chain,
-      tokenAddress: item.tokenAddress,
-      nextStatus: 'PREHEAT',
-      stage: 'activation',
-      outcome: 'PASS',
-      reasonCode: `${reason}_REAL_POOL`,
-      observedAtMs,
-      raw: info.raw,
-      normalized: {
-        biggestPoolAddress: info.biggestPoolAddress,
-        liquidityUsd: info.liquidityUsd,
-        poolAgeMs
-      },
-      thresholds: {
-        ...this.marketCapThresholds(),
-        liquidityMinUsd: this.config.thresholds.liquidityMinUsd,
-        poolAgeMaxSeconds: this.config.thresholds.poolAgeMaxSeconds
-      }
+    if (
+      latestOneMinute.rank > DISCOVERY_POLICY.realPoolRankMax ||
+      latestOneMinute.marketCapUsd < DISCOVERY_POLICY.realPoolMarketCapUsd.min ||
+      latestOneMinute.marketCapUsd > DISCOVERY_POLICY.realPoolMarketCapUsd.max
+    ) return;
+
+    const opportunityType = poolAgeMs! <= DISCOVERY_POLICY.newPoolMaxAgeMs
+      ? 'new_pool'
+      : 'revival';
+    if (opportunityType === 'revival' && !publicReady) return;
+    withTransaction(this.database, () => {
+      const activated = this.candidates.activate({
+        chain,
+        tokenAddress: item.tokenAddress,
+        opportunityType,
+        priceUsd: latestOneMinute.priceUsd,
+        ruleVersion: this.config.ruleVersion,
+        atMs: observedAtMs
+      });
+      if (!['DISCOVERED', 'RADAR'].includes(activated.status)) return;
+      this.candidates.transition(chain, item.tokenAddress, 'PREHEAT', { atMs: observedAtMs });
+      this.events.record({
+        chain,
+        tokenAddress: item.tokenAddress,
+        stage: 'activation',
+        outcome: 'PASS',
+        reasonCode: `${reason}_${opportunityType === 'new_pool' ? 'REAL_POOL' : 'REVIVAL_POOL'}`,
+        source: 'gmgn',
+        observedAtMs,
+        raw: info.raw,
+        normalized: {
+          biggestPoolAddress: info.biggestPoolAddress,
+          liquidityUsd: info.liquidityUsd,
+          poolAgeMs,
+          opportunityType
+        },
+        thresholds: {
+          realPoolMarketCapUsd: DISCOVERY_POLICY.realPoolMarketCapUsd,
+          realPoolRankMax: DISCOVERY_POLICY.realPoolRankMax,
+          newPoolMaxAgeMs: DISCOVERY_POLICY.newPoolMaxAgeMs,
+          liquidityMinUsd: this.config.thresholds.liquidityMinUsd
+        },
+        decisionRuleVersion: this.config.ruleVersion
+      });
     });
   }
 

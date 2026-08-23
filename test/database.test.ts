@@ -14,6 +14,7 @@ import {
   OutboxRepository,
   PoolBindingRepository,
   QualificationEventRepository,
+  RankSnapshotFetchRepository,
   RankSnapshotRepository,
   RuleVersionRepository
 } from '../src/db/repositories.js';
@@ -96,6 +97,10 @@ test('keeps first-seen values immutable and permanently rejects chase-limit cand
 
   assert.equal(duplicate.created, false);
   assert.deepEqual(duplicate.candidate, candidate);
+  candidates.activate({
+    chain: 'bsc', tokenAddress: BSC_TOKEN, opportunityType: 'new_pool',
+    priceUsd: 0.001, ruleVersion: 'rules-a', atMs: 150
+  });
   const rejected = candidates.updateHighWater({
     chain: 'bsc',
     tokenAddress: BSC_TOKEN,
@@ -133,6 +138,10 @@ test('keeps first-seen values immutable and permanently rejects chase-limit cand
 
 test('rolls back high-water rejection when its evidence cannot be persisted', () => {
   const { database, candidates } = seedBscCandidate();
+  candidates.activate({
+    chain: 'bsc', tokenAddress: BSC_TOKEN, opportunityType: 'new_pool',
+    priceUsd: 0.001, ruleVersion: 'rules-a', atMs: 150
+  });
   assert.throws(
     () =>
       candidates.updateHighWater({
@@ -173,6 +182,21 @@ test('persists stable rule versions, snapshots, immutable pool binding and evide
     liquidityUsd: 13_000,
     raw: { z: 2, a: 1 }
   });
+  const fetches = new RankSnapshotFetchRepository(database);
+  fetches.insert({
+    chain: 'bsc', interval: '1m', fetchedAtMs: 150,
+    itemCount: 1, discoveryRuleVersion: 'rules-a'
+  });
+  fetches.insert({
+    chain: 'bsc', interval: '1m', fetchedAtMs: 160,
+    itemCount: 0, discoveryRuleVersion: 'rules-a'
+  });
+  const rankSnapshots = new RankSnapshotRepository(database);
+  assert.equal(rankSnapshots.findLatestSuccessfulFetchAt('bsc', '1m'), 160);
+  assert.notEqual(
+    rankSnapshots.findLatest('bsc', BSC_TOKEN)!.fetchedAtMs,
+    rankSnapshots.findLatestSuccessfulFetchAt('bsc', '1m')
+  );
   assert.throws(
     () =>
       new RankSnapshotRepository(database).insert({
@@ -291,6 +315,8 @@ test('upgrades legacy migration metadata without changing application data', () 
       (3, 'compact_rank_fetches', 3),
       (4, 'signal_delivery_followups', 4),
       (5, 'signal_evaluation_and_chain_release', 5);
+    INSERT INTO _migrations(version, name, applied_at_ms)
+    VALUES (6, 'optimized_low_cap_signal_rules', 6);
   `);
   seeded.database.close();
 
@@ -438,4 +464,108 @@ test('restart converts a crash-after-send window to non-retryable UNCERTAIN', ()
   assert.equal(recovered.lastError, 'process_interrupted_while_sending');
   assert.throws(() => restartedOutbox.claim(recovered.id), /not claimable/);
   restarted.close();
+});
+
+test('legacy migration resets only unsent candidates that must establish a fresh activation', () => {
+  const { database, candidates } = seedBscCandidate();
+  const token = (index: number) => `0x${index.toString(16).padStart(40, '0')}`;
+  const create = (address: string) => {
+    candidates.findOrCreate({
+      chain: 'bsc',
+      tokenAddress: address,
+      firstSeenAtMs: 100,
+      firstSeenPriceUsd: 0.001,
+      firstSeenRank: 5,
+      firstSeenMarketCapUsd: 30_000,
+      firstSeenLiquidityUsd: 12_000,
+      discoveryRuleVersion: 'rules-a'
+    });
+  };
+
+  const active = token(101);
+  create(active);
+  candidates.transition('bsc', active, 'PREHEAT', { atMs: 110 });
+  new PoolBindingRepository(database).bind({
+    chain: 'bsc',
+    tokenAddress: active,
+    poolAddress: token(201),
+    candidateSide: 'base',
+    counterTokenAddress: token(202),
+    boundAtMs: 120
+  });
+
+  const oldTerminal = token(102);
+  create(oldTerminal);
+  candidates.transition('bsc', oldTerminal, 'REJECTED', {
+    atMs: 120,
+    terminalReason: 'POOL_TOO_OLD'
+  });
+
+  const sentTerminal = token(103);
+  create(sentTerminal);
+  candidates.transition('bsc', sentTerminal, 'REJECTED', {
+    atMs: 120,
+    terminalReason: 'POOL_TOO_OLD'
+  });
+  const sentOutbox = new OutboxRepository(database);
+  const sentRecord = sentOutbox.create({
+    chain: 'bsc',
+    tokenAddress: sentTerminal,
+    messageKind: 'signal',
+    channelRole: 'validation',
+    payload: {},
+    createdAtMs: 125
+  });
+  sentOutbox.claim(sentRecord.id, 126);
+  sentOutbox.markSent(sentRecord.id, '103', 127);
+
+  const pendingActive = token(105);
+  create(pendingActive);
+  candidates.transition('bsc', pendingActive, 'PREHEAT', { atMs: 128 });
+  new OutboxRepository(database).create({
+    chain: 'bsc',
+    tokenAddress: pendingActive,
+    messageKind: 'signal',
+    channelRole: 'validation',
+    payload: {},
+    createdAtMs: 129
+  });
+
+  const currentChase = token(104);
+  create(currentChase);
+  candidates.activate({
+    chain: 'bsc',
+    tokenAddress: currentChase,
+    opportunityType: 'revival',
+    priceUsd: 0.001,
+    ruleVersion: 'rules-a',
+    atMs: 130
+  });
+  candidates.updateHighWater({
+    chain: 'bsc',
+    tokenAddress: currentChase,
+    observedPriceUsd: 0.00181,
+    maxGainRatio: 0.8,
+    decisionRuleVersion: 'rules-a',
+    observedAtMs: 140,
+    raw: {}
+  });
+
+  assert.equal(candidates.reopenEligibleLegacy('rules-a', 200), 3);
+  assert.equal(candidates.find('bsc', active)!.status, 'DISCOVERED');
+  assert.equal(new PoolBindingRepository(database).find('bsc', active), undefined);
+  assert.equal(candidates.find('bsc', oldTerminal)!.status, 'DISCOVERED');
+  assert.equal(candidates.find('bsc', sentTerminal)!.status, 'REJECTED');
+  assert.equal(candidates.find('bsc', pendingActive)!.status, 'DISCOVERED');
+  assert.equal(
+    new OutboxRepository(database).find('bsc', pendingActive, 'signal')!.status,
+    'PENDING'
+  );
+  assert.equal(candidates.find('bsc', currentChase)!.status, 'REJECTED');
+  assert.equal(candidates.reopenEligibleLegacy('rules-a', 300), 0);
+  assert.equal(
+    database.prepare("SELECT count(*) AS count FROM qualification_events WHERE reason_code IN ('LEGACY_ACTIVE_RESET', 'LEGACY_TERMINAL_REOPENED')").get()!.count,
+    3
+  );
+  database.close();
 });

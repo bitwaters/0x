@@ -93,6 +93,7 @@ export class EvaluationService {
     for (const chain of ['sol', 'bsc'] as const) {
       withTransaction(this.database, () => {
         this.repository.maybePromoteBeta(chain, this.now());
+        this.repository.createDueReports(chain, this.now());
       });
     }
   }
@@ -139,7 +140,7 @@ export class EvaluationService {
     if (point.horizonSeconds === 10) {
       const entryTradeMaxDelayMs =
         point.entryTradeMaxDelayMs ?? EVALUATION_POLICY.entryTradeMaxDelayMs;
-      const entryWindowEndAtMs = point.scheduledAtMs + entryTradeMaxDelayMs;
+      const entryWindowEndAtMs = sample.receiptAtMs + entryTradeMaxDelayMs;
       if (this.now() < entryWindowEndAtMs) {
         withTransaction(this.database, () => {
           this.repository.deferEntryUntil(point, entryWindowEndAtMs, this.now());
@@ -148,8 +149,7 @@ export class EvaluationService {
       }
       if (
         point.entryPolicyVersion !== EVALUATION_POLICY.entryPolicyVersion ||
-        point.entryTradeMaxDelayMs === null ||
-        sample.decisionRuleVersion !== this.config.ruleVersion
+        point.entryTradeMaxDelayMs === null
       ) {
         withTransaction(this.database, () => {
           this.repository.markEntryProviderMissing(
@@ -257,7 +257,7 @@ export class EvaluationService {
     if (point.horizonSeconds === 10) {
       const entryWindowCovered = isEntryWindowCovered(
         trades,
-        targetAtMs,
+        sample.receiptAtMs,
         EVALUATION_POLICY.poolTradesPageSize
       );
       if (!entryWindowCovered) {
@@ -272,23 +272,30 @@ export class EvaluationService {
       }
       const entry = selectEntryTrade(
         trades,
-        targetAtMs,
+        sample.receiptAtMs,
         point.entryTradeMaxDelayMs!
       );
       withTransaction(this.database, () => {
         if (entry === undefined) {
           this.repository.markEntryUnavailable(point, this.now());
         } else {
+          const entryResult = evaluateTradePath(
+            trades,
+            entry.candidatePriceUsd,
+            entry.blockTimestampMs,
+            targetAtMs
+          );
           this.repository.completeEntry({
             point,
             priceUsd: entry.candidatePriceUsd,
             tradeAtMs: entry.blockTimestampMs,
             ...(sellAtMs === undefined ? {} : { sellAtMs }),
             observedAtMs: this.now(),
+            ...(entryResult === undefined ? {} : { result: entryResult }),
             facts: {
-              entryTargetAtMs: targetAtMs,
+              entryTargetAtMs: sample.receiptAtMs,
               entryTradeAtMs: entry.blockTimestampMs,
-              entryDelayMs: entry.blockTimestampMs - targetAtMs,
+              entryDelayMs: entry.blockTimestampMs - sample.receiptAtMs,
               reserveUsd: detail.reserveUsd,
               security,
               sellTradeObserved: sellAtMs !== undefined

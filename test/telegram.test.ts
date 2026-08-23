@@ -68,13 +68,13 @@ function trade(
     id,
     kind,
     blockTimestampMs: atMs,
-    volumeUsd,
+    volumeUsd: volumeUsd * 5,
     candidatePriceUsd: priceUsd,
     fromTokenAddress: kind === 'buy' ? COUNTER : TOKEN,
     toTokenAddress: kind === 'buy' ? TOKEN : COUNTER,
     fromTokenAmount: 1,
     toTokenAmount: 1,
-    raw: { id, kind, volumeUsd, priceUsd }
+    raw: { id, kind, volumeUsd: volumeUsd * 5, priceUsd }
   };
 }
 
@@ -160,14 +160,26 @@ function setup(now: { value: number }) {
     firstSeenLiquidityUsd: 12_000,
     discoveryRuleVersion: config.ruleVersion
   });
+  candidates.activate({
+    chain: 'bsc',
+    tokenAddress: TOKEN,
+    opportunityType: 'new_pool',
+    priceUsd: 100,
+    ruleVersion: config.ruleVersion,
+    atMs: now.value - 12_000
+  });
   candidates.transition('bsc', TOKEN, 'PREHEAT', { atMs: now.value - 11_000 });
-  new PoolBindingRepository(database).bind({
+  const bindings = new PoolBindingRepository(database);
+  bindings.bind({
     chain: 'bsc',
     tokenAddress: TOKEN,
     poolAddress: POOL,
     candidateSide: 'base',
     counterTokenAddress: COUNTER,
     boundAtMs: now.value - 10_000
+  });
+  bindings.setQualificationReference({
+    chain: 'bsc', tokenAddress: TOKEN, priceUsd: 100, atMs: now.value
   });
   candidates.setDecisionRuleVersion('bsc', TOKEN, config.ruleVersion, now.value);
   candidates.transition('bsc', TOKEN, 'MONITORING', { atMs: now.value });
@@ -181,6 +193,7 @@ function setup(now: { value: number }) {
     decisionTradeAtMs: now.value,
     firstSeenAtMs: now.value - 20_000,
     sampledMaxGain: 0.5,
+    opportunityType: 'new_pool',
     security: {
       top10Ratio: 0.2,
       insiderRatio: 0.1,
@@ -374,13 +387,52 @@ test('routes radar only to the radar channel and labels it non-formal', async ()
     firstSeenAtMs: now.value - 20_000,
     marketCapUsd: 80_000,
     sampledMaxGain: 0.5,
-    status: 'PREHEAT',
-    renderedAtMs: now.value
+    stage: 'real_pool'
   });
   assert.equal(result.outcome, 'SENT');
   assert.equal(telegram.sends[0]!.chatId, '-1001');
   assert.match(telegram.sends[0]!.text, /非正式/);
   assert.deepEqual(telegram.sends[0]!.options, telegramCardOptions('bsc', TOKEN));
+  state.database.close();
+});
+
+test('radar edits one message only for semantic changes and retries a failed edit finitely', async () => {
+  const now = { value: 9_600_000 };
+  const state = setup(now);
+  const telegram = new FakeTelegram();
+  const delivery = service({ now, setup: state, telegram, price: { value: 100 } });
+  const bonding = {
+    chain: 'bsc' as const,
+    tokenAddress: TOKEN,
+    firstSeenAtMs: now.value - 20_000,
+    marketCapUsd: 80_000,
+    sampledMaxGain: 0.5,
+    stage: 'bonding' as const
+  };
+
+  assert.equal((await delivery.sendRadar(bonding)).outcome, 'SENT');
+  assert.equal((await delivery.sendRadar(bonding)).outcome, 'DUPLICATE');
+  assert.equal(telegram.sends.length, 1);
+  assert.equal(telegram.edits.length, 0);
+
+  telegram.editErrors.push(new Error('temporary edit failure'));
+  const upgraded = { ...bonding, stage: 'real_pool' as const };
+  assert.equal((await delivery.sendRadar(upgraded)).outcome, 'RETRYABLE_FAILURE');
+  assert.equal((await delivery.sendRadar(upgraded)).outcome, 'SENT');
+  assert.equal(telegram.sends.length, 1);
+  assert.equal(telegram.edits.length, 2);
+  assert.equal(telegram.edits[1]!.messageId, telegram.edits[0]!.messageId);
+  assert.match(telegram.edits[1]!.text, /真实池验证中/);
+  assert.equal((await delivery.sendRadar(upgraded)).outcome, 'DUPLICATE');
+  assert.equal(telegram.edits.length, 2);
+
+  telegram.editErrors.push(new Error('one'), new Error('two'), new Error('three'));
+  const waiting = { ...bonding, stage: 'heat_wait' as const };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    assert.equal((await delivery.sendRadar(waiting)).outcome, 'RETRYABLE_FAILURE');
+  }
+  assert.equal((await delivery.sendRadar(waiting)).outcome, 'RETRYABLE_FAILURE');
+  assert.equal(telegram.edits.length, 5);
   state.database.close();
 });
 
@@ -477,8 +529,7 @@ test('renders fused SOL/BSC cards safely with front-loaded CA and one preserved 
     firstSeenAtMs: now.value - 30_000,
     marketCapUsd: 88_000,
     sampledMaxGain: 0.5,
-    status: 'RADAR',
-    renderedAtMs: now.value,
+    stage: 'bonding',
     presentation: solEligibility.presentation!
   });
   assert.match(radar.text, /Bonding Curve 观察中/);

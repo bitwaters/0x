@@ -1,4 +1,6 @@
 export const QUALIFICATION_POLICY = Object.freeze({
+  marketCapUsd: { min: 20_000, max: 300_000 },
+  trendingRankMax: 20,
   trendingMaxAgeMs: 15_000,
   tokenInfoMaxAgeMs: 30_000,
   securityMaxAgeMs: 30_000,
@@ -7,7 +9,9 @@ export const QUALIFICATION_POLICY = Object.freeze({
   tradeMinCount: 5,
   tradeMaxCount: 10,
   latestTradeMaxAgeMs: 15_000,
+  tradeVolumeMinUsd: 500,
   buyCountMinRatio: 0.6,
+  buyUsdMinRatio: 0.6,
   largestTradeMaxRatio: 0.4,
   detailMinIntervalMs: 10_000,
   liquidityMaxDeclineRatio: 0.1,

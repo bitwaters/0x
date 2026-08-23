@@ -115,6 +115,7 @@ function snapshot(tokenAddress: string, receiptAtMs: number, ruleVersion: string
       decisionTradeAtMs: receiptAtMs - 200,
       firstSeenAtMs: receiptAtMs - 20_000,
       sampledMaxGain: 0.4,
+      opportunityType: 'new_pool',
       security: { top10Ratio: 0.2, buyTaxRatio: 0.01, sellTaxRatio: 0.01 },
       trades: {
         passed: true,
@@ -123,6 +124,8 @@ function snapshot(tokenAddress: string, receiptAtMs: number, ruleVersion: string
         latestTradeAtMs: receiptAtMs - 200,
         decisionPriceUsd: 100,
         buyCountRatio: 0.6,
+        totalUsd: 500,
+        buyUsdRatio: 0.6,
         netBuyUsd: 10,
         largestTradeRatio: 0.4
       },
@@ -191,6 +194,27 @@ function addSample(
   });
 }
 
+function markValidEntry(
+  database: SqliteDatabase,
+  sampleId: number,
+  receiptAtMs: number
+): void {
+  database.prepare(`
+    UPDATE delivered_signal_samples
+    SET entry_status = 'COMPLETE', entry_price_usd = 100,
+        entry_trade_at_ms = ?, updated_at_ms = ?
+    WHERE id = ?
+  `).run(receiptAtMs, receiptAtMs, sampleId);
+  database.prepare(`
+    UPDATE signal_evaluation_points
+    SET status = 'COMPLETE', observed_at_ms = scheduled_at_ms,
+        price_usd = 100, gross_return = 0, mfe = 0, mae = 0,
+        path_30_15 = 'NONE', path_2x_30 = 'NONE',
+        source = 'TRADES', granularity = 'trade', details_json = '{}'
+    WHERE sample_id = ? AND horizon_seconds = 10
+  `).run(sampleId);
+}
+
 class MarketSource {
   trades: readonly CoinGeckoTrade[] = [];
   bars: readonly CoinGeckoOhlcvBar[] = [];
@@ -233,7 +257,7 @@ class SecuritySource {
   }
 }
 
-test('entry uses the first trade from the target through the inclusive three-second window', () => {
+test('entry uses the first trade from receipt through the inclusive ten-second window', () => {
   const token = tokenFor(1);
   const receipt = 1_000_000;
   const input = [
@@ -242,25 +266,24 @@ test('entry uses the first trade from the target through the inclusive three-sec
     trade(token, 'after', 'buy', 102, receipt + 10_001)
   ];
   assert.equal(
-    selectEntryTrade(input, receipt + 10_000, EVALUATION_POLICY.entryTradeMaxDelayMs)!.id,
-    'at'
+    selectEntryTrade(input, receipt, EVALUATION_POLICY.entryTradeMaxDelayMs)!.id,
+    'before'
   );
   assert.equal(
     selectEntryTrade(
       input.filter((item) => item.id !== 'at'),
-      receipt + 10_000,
+      receipt,
       EVALUATION_POLICY.entryTradeMaxDelayMs
     )!.id,
-    'after'
+    'before'
   );
   assert.equal(
     selectEntryTrade(
       [
-        trade(token, 'before', 'buy', 100, receipt + 9_999),
-        trade(token, 'inclusive', 'buy', 103, receipt + 13_000),
-        trade(token, 'outside', 'buy', 104, receipt + 13_001)
+        trade(token, 'inclusive', 'buy', 103, receipt + 10_000),
+        trade(token, 'outside', 'buy', 104, receipt + 10_001)
       ],
-      receipt + 10_000,
+      receipt,
       EVALUATION_POLICY.entryTradeMaxDelayMs
     )!.id,
     'inclusive'
@@ -268,10 +291,9 @@ test('entry uses the first trade from the target through the inclusive three-sec
   assert.equal(
     selectEntryTrade(
       [
-        trade(token, 'before', 'buy', 100, receipt + 9_999),
-        trade(token, 'outside', 'buy', 104, receipt + 13_001)
+        trade(token, 'outside', 'buy', 104, receipt + 10_001)
       ],
-      receipt + 10_000,
+      receipt,
       EVALUATION_POLICY.entryTradeMaxDelayMs
     ),
     undefined
@@ -279,7 +301,7 @@ test('entry uses the first trade from the target through the inclusive three-sec
   assert.equal(
     isEntryWindowCovered(
       input,
-      receipt + 10_000,
+      receipt,
       EVALUATION_POLICY.poolTradesPageSize
     ),
     true
@@ -287,9 +309,9 @@ test('entry uses the first trade from the target through the inclusive three-sec
   assert.equal(
     isEntryWindowCovered(
       Array.from({ length: 300 }, (_, index) =>
-        trade(token, `saturated-${index}`, 'buy', 100, receipt + 13_001 + index)
+        trade(token, `saturated-${index}`, 'buy', 100, receipt + 10_001 + index)
       ),
-      receipt + 10_000,
+      receipt,
       EVALUATION_POLICY.poolTradesPageSize
     ),
     false
@@ -297,9 +319,9 @@ test('entry uses the first trade from the target through the inclusive three-sec
   assert.equal(
     isEntryWindowCovered(
       Array.from({ length: EVALUATION_POLICY.poolTradesPageSize }, (_, index) =>
-        trade(token, `partial-${index}`, 'buy', 100, receipt + 10_001 + index)
+        trade(token, `partial-${index}`, 'buy', 100, receipt + 1 + index)
       ),
-      receipt + 10_000,
+      receipt,
       EVALUATION_POLICY.poolTradesPageSize
     ),
     false
@@ -377,12 +399,12 @@ test('evaluation records the 10-second entry, sell proxy, trades path and OHLCV 
   const { database, runtime } = setupDatabase();
   const receipt = 2_000_000;
   const sample = addSample(database, runtime, 2, receipt);
-  const now = { value: receipt + 12_999 };
+  const now = { value: receipt + 9_999 };
   const market = new MarketSource(now);
   const gmgn = new SecuritySource(now);
   market.trades = [
     trade(sample.tokenAddress, 'sell', 'sell', 99, receipt + 8_000),
-    trade(sample.tokenAddress, 'entry', 'buy', 100, receipt + 11_000),
+    trade(sample.tokenAddress, 'entry', 'buy', 100, receipt + 1_000),
     trade(sample.tokenAddress, 'future', 'buy', 500, receipt + 14_000)
   ];
   const service = new EvaluationService(database, runtime, market, gmgn, () => now.value);
@@ -396,13 +418,13 @@ test('evaluation records the 10-second entry, sell proxy, trades path and OHLCV 
     .get(sample.id)!;
   assert.deepEqual(
     [entrySchedule.scheduled_at_ms, entrySchedule.next_attempt_at_ms],
-    [receipt + 10_000, receipt + 13_000]
+    [receipt + 10_000, receipt + 10_000]
   );
-  now.value = receipt + 13_000;
+  now.value = receipt + 10_000;
   await service.tick();
   const entered = new EvaluationRepository(database).findSample(sample.id)!;
   assert.equal(entered.entryPriceUsd, 100);
-  assert.equal(entered.entryTradeAtMs, receipt + 11_000);
+  assert.equal(entered.entryTradeAtMs, receipt + 1_000);
   assert.equal(entered.sellTradeObserved, true);
   const entryDetails = JSON.parse(String(database
     .prepare(`
@@ -412,7 +434,7 @@ test('evaluation records the 10-second entry, sell proxy, trades path and OHLCV 
     .get(sample.id)!.details_json)) as { entryDelayMs: number; entryTradeAtMs: number };
   assert.deepEqual(
     [entryDetails.entryDelayMs, entryDetails.entryTradeAtMs],
-    [1_000, receipt + 11_000]
+    [1_000, receipt + 1_000]
   );
 
   now.value = receipt + 30_000;
@@ -482,7 +504,7 @@ test('pool disappearance is terminal while provider failure retries once and rem
   const missingSetup = setupDatabase();
   const missingReceipt = 4_000_000;
   const missingSample = addSample(missingSetup.database, missingSetup.runtime, 4, missingReceipt);
-  const missingNow = { value: missingReceipt + 13_000 };
+  const missingNow = { value: missingReceipt + 10_000 };
   const missingSecurity = new SecuritySource(missingNow);
   missingSecurity.error = new Error('gmgn unavailable');
   const missingService = new EvaluationService(
@@ -518,7 +540,9 @@ test('pool disappearance is terminal while provider failure retries once and rem
       .get(missingSample.id)!.count,
     9
   );
-  const report = new EvaluationRepository(missingSetup.database).liveReport('bsc', missingNow.value) as {
+  const report = new EvaluationRepository(missingSetup.database).liveReport(
+    'bsc', missingReceipt + 900_000
+  ) as {
     totalDelivered: number;
     segments: Array<{ providerMissing: number; coverage: number }>;
   };
@@ -589,7 +613,7 @@ test('a legacy due entry waits for the window end and then fails closed after re
   database.close();
 
   database = openDatabase(path);
-  const now = { value: receipt + 12_999 };
+  const now = { value: receipt + 9_999 };
   const market = new MarketSource(now);
   await new EvaluationService(
     database,
@@ -606,12 +630,12 @@ test('a legacy due entry waits for the window end and then fails closed after re
     .get(sample.id)!;
   assert.deepEqual(
     [point.status, point.next_attempt_at_ms, market.detailCalls],
-    ['PENDING', receipt + 13_000, 0]
+    ['PENDING', receipt + 10_000, 0]
   );
   database.close();
 
   database = openDatabase(path);
-  now.value = receipt + 13_000;
+  now.value = receipt + 10_000;
   await new EvaluationService(
     database,
     runtime,
@@ -631,7 +655,7 @@ test('a legacy due entry waits for the window end and then fails closed after re
   database.close();
 });
 
-test('a pending entry is not evaluated under a different decision rule version', async () => {
+test('a pending entry keeps its persisted entry policy across a decision rule change', async () => {
   const { database, runtime } = setupDatabase();
   const receipt = 4_800_000;
   const sample = addSample(database, runtime, 7, receipt);
@@ -639,10 +663,10 @@ test('a pending entry is not evaluated under a different decision rule version',
     NODE_ENV: 'test',
     GMGN_API_KEY: 'gmgn-test',
     COINGECKO_PRO_API_KEY: 'cg-test',
-    MARKET_CAP_MAX_USD: '600000'
+    TOP10_MAX_RATIO: '0.2'
   });
   assert.notEqual(changedRuntime.ruleVersion, runtime.ruleVersion);
-  const now = { value: receipt + 13_000 };
+  const now = { value: receipt + 10_000 };
   const market = new MarketSource(now);
   await new EvaluationService(
     database,
@@ -657,33 +681,28 @@ test('a pending entry is not evaluated under a different decision rule version',
       WHERE sample_id = ? AND horizon_seconds = 10
     `)
     .get(sample.id)!;
-  assert.equal(point.status, 'PROVIDER_MISSING');
-  assert.equal(JSON.parse(String(point.details_json)).providerError, 'ENTRY_POLICY_UNAVAILABLE');
-  assert.equal(market.detailCalls, 0);
+  assert.equal(point.status, 'ENTRY_UNAVAILABLE');
+  assert.ok(market.detailCalls > 0);
   database.close();
 });
 
-test('twenty ordered 15-minute samples promote one chain without a day gate and suspension starts a new epoch', () => {
+test('five evaluable 15-minute samples promote one chain without sequence blocking', () => {
   const { database, runtime } = setupDatabase();
   const repository = new EvaluationRepository(database);
-  const samples = Array.from({ length: 20 }, (_, index) =>
+  const samples = Array.from({ length: 6 }, (_, index) =>
     addSample(database, runtime, 100 + index, 5_000_000 + index)
   );
+  for (const sample of samples.slice(1)) {
+    markValidEntry(database, sample.id, sample.receiptAtMs);
+  }
   database
     .prepare(`
       UPDATE signal_evaluation_points SET status = 'COMPLETE'
       WHERE horizon_seconds = 900 AND sample_id IN (
-        SELECT id FROM delivered_signal_samples WHERE validation_seq BETWEEN 2 AND 20
+        SELECT id FROM delivered_signal_samples WHERE validation_seq BETWEEN 2 AND 6
       )
     `)
     .run();
-  assert.equal(repository.maybePromoteBeta('bsc', 5_900_000), false);
-  database
-    .prepare(`
-      UPDATE signal_evaluation_points SET status = 'TERMINAL_NEGATIVE'
-      WHERE sample_id = ? AND horizon_seconds = 900
-    `)
-    .run(samples[0]!.id);
   assert.equal(repository.maybePromoteBeta('bsc', 5_900_100), true);
   assert.equal(repository.chainState('bsc').state, 'BETA');
   assert.equal(repository.chainState('sol').state, 'VALIDATING');
@@ -714,14 +733,15 @@ test('twenty ordered 15-minute samples promote one chain without a day gate and 
   database.close();
 });
 
-test('early terminal outcomes mature only after each 15-minute checkpoint is due', async () => {
+test('terminal outcomes with valid entry mature only after each 15-minute checkpoint is due', async () => {
   const { database, runtime } = setupDatabase();
   const repository = new EvaluationRepository(database);
   const baseReceipt = 5_920_000;
-  const samples = Array.from({ length: 20 }, (_, index) =>
+  const samples = Array.from({ length: 5 }, (_, index) =>
     addSample(database, runtime, 800 + index, baseReceipt + index)
   );
   for (const sample of samples) {
+    markValidEntry(database, sample.id, sample.receiptAtMs);
     repository.markTerminalNegative(sample.id, 'FIXED_POOL_MISSING', sample.receiptAtMs + 10_000);
   }
   const lastMaturityAtMs = samples.at(-1)!.receiptAtMs + 900_000;
@@ -738,12 +758,13 @@ test('early terminal outcomes mature only after each 15-minute checkpoint is due
   database.close();
 });
 
-test('report status counts use the same due denominator and expose entry unavailable', () => {
+test('report status counts use the 15-minute due denominator and expose entry unavailable', () => {
   const { database, runtime } = setupDatabase();
   const repository = new EvaluationRepository(database);
   const nowMs = 5_980_000;
-  const dueSample = addSample(database, runtime, 850, nowMs - 20_000);
-  const futureTerminal = addSample(database, runtime, 851, nowMs - 5_000);
+  const dueSample = addSample(database, runtime, 850, nowMs - 901_000);
+  const futureTerminal = addSample(database, runtime, 851, nowMs - 899_000);
+  markValidEntry(database, futureTerminal.id, futureTerminal.receiptAtMs);
   database
     .prepare(`
       UPDATE signal_evaluation_points
@@ -762,14 +783,14 @@ test('report status counts use the same due denominator and expose entry unavail
         coverage: number;
       }>;
     }
-  ).segments.find((item) => item.horizonSeconds === 10)!;
+  ).segments.find((item) => item.horizonSeconds === 900)!;
   assert.deepEqual(
     [segment.due, segment.terminalNegative, segment.entryUnavailable, segment.coverage],
     [1, 0, 1, 0]
   );
   const matured = (
     repository.liveReport('bsc', nowMs + 5_000) as { segments: typeof segment[] }
-  ).segments.find((item) => item.horizonSeconds === 10)!;
+  ).segments.find((item) => item.horizonSeconds === 900)!;
   assert.deepEqual(
     [matured.due, matured.terminalNegative, matured.entryUnavailable, matured.coverage],
     [2, 1, 1, 0.5]
@@ -791,34 +812,38 @@ test('validation sequence allocation survives a database restart', () => {
   database.close();
 });
 
-test('reports are generated once at 50/100/200/+100 and parameter reviews every 20', () => {
+test('reports are generated once per rule version at 5 and every additional 20 evaluable samples', () => {
   const { database, runtime } = setupDatabase();
-  for (let index = 1; index <= 300; index += 1) {
-    addSample(database, runtime, 1_000 + index, 6_000_000 + index);
+  const repository = new EvaluationRepository(database);
+  const samples = [];
+  for (let index = 1; index <= 25; index += 1) {
+    samples.push(addSample(database, runtime, 1_000 + index, 6_000_000 + index));
   }
-  const milestones = database
-    .prepare("SELECT boundary_count FROM evaluation_reports WHERE kind = 'MILESTONE' ORDER BY boundary_count")
-    .all()
-    .map((row) => (row as { boundary_count: number }).boundary_count);
-  assert.deepEqual(milestones, [50, 100, 200, 300]);
+  for (const sample of samples) markValidEntry(database, sample.id, sample.receiptAtMs);
+  database.prepare(`
+    UPDATE signal_evaluation_points SET status = 'COMPLETE'
+    WHERE horizon_seconds = 900
+  `).run();
+  repository.createDueReports('bsc', 6_901_000);
+  repository.createDueReports('bsc', 6_901_000);
   const reviews = database
     .prepare("SELECT boundary_count FROM evaluation_reports WHERE kind = 'PARAMETER_REVIEW' ORDER BY boundary_count")
     .all()
     .map((row) => (row as { boundary_count: number }).boundary_count);
-  assert.deepEqual(reviews, Array.from({ length: 15 }, (_, index) => (index + 1) * 20));
+  assert.deepEqual(reviews, [5, 25]);
   const segmented = JSON.parse(
     String(
       database
-        .prepare("SELECT snapshot_json FROM evaluation_reports WHERE kind = 'MILESTONE' AND boundary_count = 300")
+        .prepare("SELECT snapshot_json FROM evaluation_reports WHERE kind = 'PARAMETER_REVIEW' AND boundary_count = 25")
         .get()!.snapshot_json
     )
   ) as { report: { totalDelivered: number; segments: unknown[] } };
-  assert.equal(segmented.report.totalDelivered, 300);
+  assert.equal(segmented.report.totalDelivered, 25);
   assert.ok(segmented.report.segments.length > 0);
   const review = JSON.parse(
     String(
       database
-        .prepare("SELECT snapshot_json FROM evaluation_reports WHERE kind = 'PARAMETER_REVIEW' AND boundary_count = 300")
+        .prepare("SELECT snapshot_json FROM evaluation_reports WHERE kind = 'PARAMETER_REVIEW' AND boundary_count = 25")
         .get()!.snapshot_json
     )
   ) as { reviewPolicy: { maximumParameterFamiliesPerChange: number } };
@@ -836,16 +861,17 @@ test('progress has no day gate and exposes the 20/50/100/200 remaining counts', 
   assert.equal(progress.state, 'VALIDATING');
   assert.equal(progress.validationDelivered, 3);
   assert.equal(progress.validationMatured15m, 0);
-  assert.deepEqual(progress.remainingTo, { '20': 20, '50': 47, '100': 97, '200': 197 });
+  assert.deepEqual(progress.remainingTo, { beta: 5, nextReport: 5 });
   database.close();
 });
 
-test('Beta progress resets to the current epoch even after twenty historical samples', () => {
+test('Beta progress resets to the current epoch even after historical samples', () => {
   const { database, runtime } = setupDatabase();
   const repository = new EvaluationRepository(database);
   const receiptAtMs = 7_500_000;
   for (let index = 1; index <= 20; index += 1) {
-    addSample(database, runtime, 3_000 + index, receiptAtMs + index);
+    const sample = addSample(database, runtime, 3_000 + index, receiptAtMs + index);
+    markValidEntry(database, sample.id, sample.receiptAtMs);
   }
   database
     .prepare(`
@@ -854,13 +880,13 @@ test('Beta progress resets to the current epoch even after twenty historical sam
       WHERE horizon_seconds = 900
     `)
     .run();
-  assert.equal(repository.progress('bsc', receiptAtMs + 901_000).remainingTo['20'], 0);
+  assert.equal(repository.progress('bsc', receiptAtMs + 901_000).remainingTo.beta, 0);
   repository.suspend('bsc', 'TEST_RESET', receiptAtMs + 902_000);
   repository.resumeAfterFix('bsc', receiptAtMs + 903_000);
   const reset = repository.progress('bsc', receiptAtMs + 904_000);
   assert.equal(reset.totalDelivered, 20);
   assert.equal(reset.validationEpoch, 2);
   assert.equal(reset.validationMatured15m, 0);
-  assert.equal(reset.remainingTo['20'], 20);
+  assert.equal(reset.remainingTo.beta, 5);
   database.close();
 });

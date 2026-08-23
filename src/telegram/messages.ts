@@ -16,8 +16,13 @@ export interface RadarMessageSnapshot {
   readonly firstSeenAtMs: number;
   readonly marketCapUsd: number;
   readonly sampledMaxGain: number;
-  readonly status: 'RADAR' | 'PREHEAT';
-  readonly renderedAtMs?: number;
+  readonly stage:
+    | 'bonding'
+    | 'real_pool'
+    | 'heat_wait'
+    | 'qualified'
+    | 'expired'
+    | 'rejected';
   readonly presentation?: TokenPresentationSnapshot;
 }
 
@@ -228,10 +233,20 @@ function ensureTelegramLength(text: string): string {
 export function renderRadarMessage(snapshot: RadarMessageSnapshot): string {
   const display = snapshot.presentation;
   const marketCap = display?.marketCapUsd ?? snapshot.marketCapUsd;
-  const stage =
-    snapshot.status === 'RADAR'
-      ? '⚪ 非正式 · Bonding Curve 观察中'
-      : '🔵 非正式 · 真实池验证中';
+  const stage = {
+    bonding: '⚪ 非正式 · Bonding Curve 观察中',
+    real_pool: '🔵 非正式 · 真实池验证中',
+    heat_wait: '🟠 非正式 · 热度暂时不足，保留内部观察',
+    qualified: '✅ 已通过正式资格',
+    expired: '⌛ 真实池验证已超时',
+    rejected: '⛔ 已停止观察'
+  }[snapshot.stage];
+  const footer =
+    snapshot.stage === 'qualified'
+      ? '⚠️ 已转入独立的验证或正式信号流程，请以对应频道卡片为准。'
+      : snapshot.stage === 'expired' || snapshot.stage === 'rejected'
+        ? '⚠️ 本次雷达观察已结束，不构成买入建议。'
+        : '⚠️ 仅为雷达观察，尚未通过真实固定池正式资格。';
   return ensureTelegramLength([
     `🔎 ${CHAIN_DISPLAY[snapshot.chain].title} · Meme 雷达`,
     stage,
@@ -243,9 +258,9 @@ export function renderRadarMessage(snapshot: RadarMessageSnapshot): string {
     `💰 市值 ${money(marketCap)} · 1m 排名 ${display === undefined ? '—' : `#${display.rank}`}`,
     `🔥 激活 ${activation(display?.activationReason)}`,
     `📈 发现后最高 ${signedPercent(snapshot.sampledMaxGain)}`,
-    `🕐 首次发现 ${relativeAge(snapshot.firstSeenAtMs, snapshot.renderedAtMs ?? Date.now())}`,
+    `🕐 首次发现 ${new Date(snapshot.firstSeenAtMs).toISOString()} (UTC)`,
     '',
-    '⚠️ 仅为雷达观察，尚未通过真实固定池正式资格。'
+    footer
   ].join('\n'));
 }
 
@@ -283,7 +298,8 @@ export function renderSignalMessage(
     `📈 当前 ${signedPercent(display?.currentGain)} · 发现后最高 ${signedPercent(value.sampledMaxGain)}`,
     '',
     '<b>⚡ 30 秒成交</b>',
-    `${value.trades.trades.length} 笔 · 买入 ${percent(value.trades.buyCountRatio)} · 净买入 ${money(value.trades.netBuyUsd)}`,
+    `${value.trades.trades.length} 笔 · 成交额 ${money(value.trades.totalUsd)} · 买入笔数 ${percent(value.trades.buyCountRatio)}`,
+    `买入金额 ${percent(value.trades.buyUsdRatio)} · 净买入 ${money(value.trades.netBuyUsd)}`,
     `💧 $100 深度占比 ${percent(value.liquidity.depthRatio)}`,
     '',
     '<b>🛡 风险</b>',

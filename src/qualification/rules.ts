@@ -8,6 +8,8 @@ export interface TradeWindowDecision {
   readonly latestTradeAtMs: number | null;
   readonly decisionPriceUsd: number | null;
   readonly buyCountRatio: number;
+  readonly totalUsd: number;
+  readonly buyUsdRatio: number;
   readonly netBuyUsd: number;
   readonly largestTradeRatio: number;
 }
@@ -42,11 +44,13 @@ export function evaluateTradeWindow(
     .reduce((sum, trade) => sum + trade.volumeUsd, 0);
   const sellUsd = totalUsd - buyUsd;
   const buyCountRatio = trades.length === 0 ? 0 : buyCount / trades.length;
+  const buyUsdRatio = totalUsd === 0 ? 0 : buyUsd / totalUsd;
   const largestTradeRatio =
     totalUsd === 0 ? 1 : Math.max(0, ...trades.map((trade) => trade.volumeUsd)) / totalUsd;
   const reasons: string[] = [];
   if (duplicateConflict) reasons.push('TRADE_ID_CONFLICT');
   if (trades.length < QUALIFICATION_POLICY.tradeMinCount) reasons.push('TRADE_COUNT_LOW');
+  if (totalUsd < QUALIFICATION_POLICY.tradeVolumeMinUsd) reasons.push('TRADE_VOLUME_LOW');
   if (
     latest === undefined ||
     nowMs - latest.blockTimestampMs > QUALIFICATION_POLICY.latestTradeMaxAgeMs
@@ -56,7 +60,9 @@ export function evaluateTradeWindow(
   if (buyCountRatio < QUALIFICATION_POLICY.buyCountMinRatio) {
     reasons.push('BUY_COUNT_RATIO_LOW');
   }
-  if (buyUsd - sellUsd <= 0) reasons.push('NET_BUY_NOT_POSITIVE');
+  if (buyUsdRatio < QUALIFICATION_POLICY.buyUsdMinRatio) {
+    reasons.push('BUY_USD_RATIO_LOW');
+  }
   if (largestTradeRatio > QUALIFICATION_POLICY.largestTradeMaxRatio) {
     reasons.push('LARGEST_TRADE_TOO_HIGH');
   }
@@ -67,6 +73,8 @@ export function evaluateTradeWindow(
     latestTradeAtMs: latest?.blockTimestampMs ?? null,
     decisionPriceUsd: latest?.candidatePriceUsd ?? null,
     buyCountRatio,
+    totalUsd,
+    buyUsdRatio,
     netBuyUsd: buyUsd - sellUsd,
     largestTradeRatio
   };
@@ -139,6 +147,9 @@ export function evaluateLiquidityStability(input: {
     return rejectedLiquidity('POOL_COMPOSITION_CHANGED');
   }
   const intervalMs = second.fetchedAtMs - first.fetchedAtMs;
+  if (intervalMs < 0) {
+    return rejectedLiquidity('DETAIL_TIME_INVALID');
+  }
   const firstSample = evaluateLiquiditySample(first, input.liquidityMinUsd);
   const secondSample = evaluateLiquiditySample(second, input.liquidityMinUsd);
   const secondCounter = secondSample.counterSideLiquidityUsd;
@@ -149,16 +160,13 @@ export function evaluateLiquidityStability(input: {
   const sampleReasons = [...new Set([...firstSample.reasons, ...secondSample.reasons])];
   if (sampleReasons.length > 0) {
     return {
-      outcome: 'REJECT',
+      outcome: 'WAIT',
       reasons: sampleReasons,
       intervalMs,
       reserveDeclineRatio,
       counterSideLiquidityUsd: secondCounter,
       depthRatio: secondSample.depthRatio
     };
-  }
-  if (intervalMs < 0) {
-    return rejectedLiquidity('DETAIL_TIME_INVALID');
   }
   if (intervalMs < QUALIFICATION_POLICY.detailMinIntervalMs) {
     return {
@@ -175,7 +183,7 @@ export function evaluateLiquidityStability(input: {
     reasons.push('POOL_LIQUIDITY_DECLINE');
   }
   return {
-    outcome: reasons.length === 0 ? 'PASS' : 'REJECT',
+    outcome: reasons.length === 0 ? 'PASS' : 'WAIT',
     reasons,
     intervalMs,
     reserveDeclineRatio,

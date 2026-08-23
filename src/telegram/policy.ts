@@ -1,5 +1,9 @@
 export const TELEGRAM_DELIVERY_POLICY = Object.freeze({
+  preSendDeadlineMs: 5_000,
+  preSendLatestTradeMaxAgeMs: 5_000,
+  preSendMinDriftRatio: -0.05,
   preSendMaxDriftRatio: 0.08,
+  preSendCounterLiquidityMaxDeclineRatio: 0.2,
   dontChaseDriftRatio: 0.08,
   expireDriftRatio: 0.15,
   activeSeconds: 90,

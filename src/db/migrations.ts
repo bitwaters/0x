@@ -316,5 +316,44 @@ export const MIGRATIONS: readonly Migration[] = [
         PRIMARY KEY (chain, kind, boundary_count)
       ) STRICT;
     `
+  },
+  {
+    version: 6,
+    name: 'optimized_low_cap_signal_rules',
+    sql: `
+      ALTER TABLE candidates ADD COLUMN opportunity_type TEXT
+        CHECK (opportunity_type IS NULL OR opportunity_type IN ('new_pool', 'revival'));
+      ALTER TABLE candidates ADD COLUMN activation_at_ms INTEGER;
+      ALTER TABLE candidates ADD COLUMN activation_price_usd REAL
+        CHECK (activation_price_usd IS NULL OR activation_price_usd > 0);
+      ALTER TABLE candidates ADD COLUMN activation_high_price_usd REAL
+        CHECK (activation_high_price_usd IS NULL OR activation_high_price_usd > 0);
+      ALTER TABLE candidates ADD COLUMN activation_sampled_max_gain REAL;
+      ALTER TABLE candidates ADD COLUMN activation_rule_version TEXT
+        REFERENCES rule_versions(version);
+      ALTER TABLE candidates ADD COLUMN legacy_reopened_at_ms INTEGER;
+
+      ALTER TABLE pool_bindings ADD COLUMN qualification_reference_price_usd REAL
+        CHECK (qualification_reference_price_usd IS NULL OR qualification_reference_price_usd > 0);
+      ALTER TABLE pool_bindings ADD COLUMN qualification_reference_at_ms INTEGER;
+
+      ALTER TABLE message_outbox ADD COLUMN applied_payload_hash TEXT;
+
+      ALTER TABLE evaluation_reports RENAME TO evaluation_reports_legacy;
+      CREATE TABLE evaluation_reports (
+        chain TEXT NOT NULL CHECK (chain IN ('sol', 'bsc')),
+        decision_rule_version TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('MILESTONE', 'PARAMETER_REVIEW')),
+        boundary_count INTEGER NOT NULL CHECK (boundary_count > 0),
+        generated_at_ms INTEGER NOT NULL,
+        snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+        PRIMARY KEY (chain, decision_rule_version, kind, boundary_count)
+      ) STRICT;
+      INSERT INTO evaluation_reports(
+        chain, decision_rule_version, kind, boundary_count, generated_at_ms, snapshot_json
+      ) SELECT chain, 'legacy-mixed', kind, boundary_count, generated_at_ms, snapshot_json
+        FROM evaluation_reports_legacy;
+      DROP TABLE evaluation_reports_legacy;
+    `
   }
 ] as const;

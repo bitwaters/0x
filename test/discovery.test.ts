@@ -120,7 +120,7 @@ test('fresh dual-rank activation handles partial Top100 and exact real-pool boun
       token,
       fetchedAtMs: now.value,
       liquidity: 10_000,
-      poolCreatedAtMs: now.value - 21_600_000
+      poolCreatedAtMs: now.value - 1_800_000
     })
   );
 
@@ -134,12 +134,12 @@ test('fresh dual-rank activation handles partial Top100 and exact real-pool boun
     snapshot('5m', now.value, [trendingItem({ token: good, rank: 18, marketCap: 20_000 })])
   );
 
-  assert.deepEqual(first, { observed: 1, created: 1, activated: 0 });
+  assert.deepEqual(first, { observed: 2, created: 2, activated: 0 });
   assert.equal(second.activated, 1);
   assert.equal(candidates.find('bsc', good)!.status, 'PREHEAT');
   assert.equal(candidates.find('bsc', good)!.decisionRuleVersion, setupRule(database));
-  assert.equal(candidates.find('bsc', outside), undefined);
-  assert.equal(database.prepare('SELECT count(*) AS count FROM rank_snapshots').get()!.count, 2);
+  assert.equal(candidates.find('bsc', outside)!.status, 'DISCOVERED');
+  assert.equal(database.prepare('SELECT count(*) AS count FROM rank_snapshots').get()!.count, 3);
   database.close();
 });
 
@@ -188,7 +188,42 @@ test('three-rising activation resets on a missing successful snapshot', async ()
   database.close();
 });
 
-test('real-pool activation rejects low liquidity and excessive pool age but keeps bonding radar', async () => {
+test('consecutive dual-rank activation resets when a successful 1m snapshot omits the token', async () => {
+  const now = { value: 1_000 };
+  const token = address(4);
+  const { database, engine, candidates } = setup(now, (candidate) =>
+    tokenInfo({
+      token: candidate,
+      fetchedAtMs: now.value,
+      pool: null,
+      openAtMs: null,
+      poolCreatedAtMs: null,
+      liquidity: 0
+    })
+  );
+
+  await engine.acceptSnapshot(snapshot('1m', 1_000, [trendingItem({ token, rank: 5 })]));
+  now.value = 1_001;
+  await engine.acceptSnapshot(snapshot('5m', 1_001, [trendingItem({ token, rank: 5 })]));
+  now.value = 4_000;
+  await engine.acceptSnapshot(snapshot('1m', 4_000, []));
+  now.value = 11_000;
+  await engine.acceptSnapshot(snapshot('5m', 11_000, [trendingItem({ token, rank: 5 })]));
+  now.value = 11_001;
+  await engine.acceptSnapshot(snapshot('1m', 11_001, [trendingItem({ token, rank: 5 })]));
+  assert.equal(candidates.find('bsc', token)!.status, 'DISCOVERED');
+
+  now.value = 21_000;
+  await engine.acceptSnapshot(snapshot('5m', 21_000, [trendingItem({ token, rank: 5 })]));
+  now.value = 21_001;
+  await engine.acceptSnapshot(snapshot('1m', 21_001, [trendingItem({ token, rank: 5 })]));
+  now.value = 31_001;
+  await engine.acceptSnapshot(snapshot('1m', 31_001, [trendingItem({ token, rank: 5 })]));
+  assert.equal(candidates.find('bsc', token)!.status, 'RADAR');
+  database.close();
+});
+
+test('real-pool activation waits on low liquidity while old pools can revive and bonding needs strong heat', async () => {
   const now = { value: 2_000_000_000 };
   const good = address(10);
   const lowLiquidity = address(11);
@@ -218,19 +253,23 @@ test('real-pool activation rejects low liquidity and excessive pool age but keep
     return tokenInfo({ token, fetchedAtMs: now.value });
   });
   const items = [good, lowLiquidity, oldPool, bonding].map((token, rank) =>
-    trendingItem({ token, rank: rank + 1, marketCap: rank === 0 ? 500_000 : 100_000 })
+    trendingItem({ token, rank: rank + 1, marketCap: rank === 0 ? 300_000 : 100_000 })
   );
   await engine.acceptSnapshot(snapshot('1m', now.value - 1_000, items));
   await engine.acceptSnapshot(snapshot('5m', now.value, items));
+  now.value += 10_000;
+  await engine.acceptSnapshot(snapshot('1m', now.value, items));
 
   assert.equal(candidates.find('bsc', good)!.status, 'PREHEAT');
-  assert.equal(candidates.find('bsc', lowLiquidity)!.terminalReason, 'LIQUIDITY_TOO_LOW');
-  assert.equal(candidates.find('bsc', oldPool)!.terminalReason, 'POOL_TOO_OLD');
+  assert.equal(candidates.find('bsc', lowLiquidity)!.status, 'DISCOVERED');
+  assert.equal(candidates.find('bsc', lowLiquidity)!.terminalReason, null);
+  assert.equal(candidates.find('bsc', oldPool)!.status, 'PREHEAT');
+  assert.equal(candidates.find('bsc', oldPool)!.opportunityType, 'revival');
   assert.equal(candidates.find('bsc', bonding)!.status, 'RADAR');
   database.close();
 });
 
-test('sampled high-water rejects only above 80 percent and terminal pullback cannot reopen', async () => {
+test('sampled high-water starts at real-pool activation and ignores bonding-era gains', async () => {
   const now = { value: 3_000_000_000 };
   const token = address(20);
   let resolutions = 0;
@@ -250,14 +289,15 @@ test('sampled high-water rejects only above 80 percent and terminal pullback can
   await engine.acceptSnapshot(
     snapshot('1m', now.value, [trendingItem({ token, rank: 8, price: 0.00181 })])
   );
-  assert.equal(candidates.find('bsc', token)!.status, 'REJECTED');
+  assert.equal(candidates.find('bsc', token)!.status, 'PREHEAT');
+  assert.equal(candidates.find('bsc', token)!.activationPriceUsd, 0.00181);
   now.value += 3_000;
   await engine.acceptSnapshot(
-    snapshot('5m', now.value, [trendingItem({ token, rank: 1, price: 0.0011 })])
+    snapshot('1m', now.value, [trendingItem({ token, rank: 7, price: 0.0033 })])
   );
-  assert.equal(candidates.find('bsc', token)!.highPriceUsd, 0.00181);
+  assert.equal(candidates.find('bsc', token)!.highPriceUsd, 0.0033);
   assert.equal(candidates.find('bsc', token)!.status, 'REJECTED');
-  assert.equal(resolutions, 0);
+  assert.equal(resolutions, 1);
   database.close();
 });
 
@@ -402,11 +442,16 @@ test('stop then start cannot revive the previous polling generation', async () =
   );
   let oneMinuteCalls = 0;
   let releaseFirst: ((value: GmgnTrendingSnapshot) => void) | undefined;
+  let markFirstStarted: (() => void) | undefined;
+  const firstStarted = new Promise<void>((resolve) => {
+    markFirstStarted = resolve;
+  });
   const source: TrendingSource = {
     async getTrending(_chain, interval) {
       if (interval === '5m') return snapshot('5m', now.value, []);
       oneMinuteCalls += 1;
       if (oneMinuteCalls === 1) {
+        markFirstStarted?.();
         return await new Promise<GmgnTrendingSnapshot>((resolve) => {
           releaseFirst = resolve;
         });
@@ -415,16 +460,15 @@ test('stop then start cannot revive the previous polling generation', async () =
     }
   };
   const poller = new DiscoveryPoller(source, engine, {
-    chains: { sol: false, bsc: true },
-    polling: { oneMinuteMs: 20, fiveMinuteMs: 100 }
+    chains: { sol: true, bsc: false },
+    polling: { oneMinuteMs: 1_000, fiveMinuteMs: 1_000 }
   });
   poller.start();
-  await new Promise((resolve) => setTimeout(resolve, 15));
+  await firstStarted;
   poller.stop();
   poller.start();
-  await new Promise((resolve) => setTimeout(resolve, 15));
   releaseFirst?.(snapshot('1m', now.value, []));
-  await new Promise((resolve) => setTimeout(resolve, 2));
+  await poller.drain();
   poller.stop();
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.equal(oneMinuteCalls, 1);
@@ -472,6 +516,42 @@ test('successful snapshot batch rolls back its header and candidate on evidence 
     0
   );
   assert.equal(database.prepare('SELECT count(*) AS count FROM candidates').get()!.count, 0);
+  database.close();
+});
+
+test('a rolled-back snapshot cannot advance the in-memory dual-rank counter', async () => {
+  const now = { value: 7_100_000_000 };
+  const token = address(61);
+  const badToken = address(62);
+  const { database, engine, candidates } = setup(now, (candidate) =>
+    tokenInfo({
+      token: candidate,
+      fetchedAtMs: now.value,
+      pool: null,
+      openAtMs: null,
+      poolCreatedAtMs: null,
+      liquidity: 0
+    })
+  );
+  await engine.acceptSnapshot(
+    snapshot('5m', now.value, [trendingItem({ token, rank: 5 })])
+  );
+
+  now.value += 1_000;
+  const invalid = trendingItem({ token: badToken, rank: 6 });
+  await assert.rejects(
+    () => engine.acceptSnapshot(snapshot('1m', now.value, [
+      trendingItem({ token, rank: 5 }),
+      { ...invalid, raw: { bad: 1n } }
+    ])),
+    /BigInt/
+  );
+
+  now.value += 1_000;
+  await engine.acceptSnapshot(
+    snapshot('1m', now.value, [trendingItem({ token, rank: 5 })])
+  );
+  assert.equal(candidates.find('bsc', token)!.status, 'DISCOVERED');
   database.close();
 });
 

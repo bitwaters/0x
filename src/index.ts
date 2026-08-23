@@ -4,7 +4,11 @@ import {
   loadRuntimeConfig
 } from './config.js';
 import { openDatabase } from './db/database.js';
-import { OutboxRepository, RuleVersionRepository } from './db/repositories.js';
+import {
+  CandidateRepository,
+  OutboxRepository,
+  RuleVersionRepository
+} from './db/repositories.js';
 import { BotRuntime } from './runtime/service.js';
 import { formatSafeError } from './security/redaction.js';
 
@@ -28,6 +32,9 @@ async function main(): Promise<void> {
       telegramDeliveryPolicy: config.telegramDeliveryPolicy,
       evaluationPolicy: config.evaluationPolicy
     });
+    const reopenedLegacyCandidates = new CandidateRepository(
+      database
+    ).reopenEligibleLegacy(config.ruleVersion);
     const recoveredInterruptedSends = new OutboxRepository(
       database
     ).recoverInterruptedSends();
@@ -35,7 +42,8 @@ async function main(): Promise<void> {
       `${JSON.stringify({
         event: 'startup_ready',
         config: getSafeConfigSummary(config),
-        recoveredInterruptedSends
+        recoveredInterruptedSends,
+        reopenedLegacyCandidates
       })}\n`
     );
     runtime = new BotRuntime(database, config);
