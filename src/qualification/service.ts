@@ -13,6 +13,7 @@ import type {
   CoinGeckoPoolDetail,
   CoinGeckoTrade
 } from '../providers/coingecko.js';
+import { FixedPoolContractError } from '../providers/coingecko.js';
 import { ContractError } from '../providers/contracts.js';
 import type {
   GmgnClient,
@@ -318,7 +319,14 @@ export class FixedPoolQualificationService {
       (persisted.candidateSide !== detail.candidateSide ||
         persisted.counterTokenAddress !== detail.counterTokenAddress)
     ) {
-      return this.reject(chain, token, 'POOL_COMPOSITION_CHANGED', { detail: detail.raw });
+      return this.reject(chain, token, 'LOCAL_POOL_IDENTITY_MISMATCH', {
+        persisted: {
+          poolAddress: persisted.poolAddress,
+          candidateSide: persisted.candidateSide,
+          counterTokenAddress: persisted.counterTokenAddress
+        },
+        detail: detail.raw
+      });
     }
 
     const key = `${chain}:${token}`;
@@ -395,6 +403,16 @@ export class FixedPoolQualificationService {
       const rawTrades = await this.coinGecko.getPoolTrades(detail, signal);
       trades = evaluateTradeWindow(rawTrades, this.now());
     } catch (error) {
+      if (
+        error instanceof FixedPoolContractError &&
+        error.reasonCode === 'LOCAL_POOL_IDENTITY_MISMATCH'
+      ) {
+        return this.reject(chain, token, error.reasonCode, {
+          operation: error.operation,
+          field: error.field,
+          error: error.message
+        });
+      }
       if (error instanceof ContractError) {
         return this.reject(chain, token, 'TRADES_CONTRACT_ERROR', {
           error: error.message

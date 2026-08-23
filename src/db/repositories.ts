@@ -927,6 +927,88 @@ export class PoolBindingRepository {
 export class QualificationEventRepository {
   constructor(private readonly database: SqliteDatabase) {}
 
+  has(input: {
+    readonly chain: Chain;
+    readonly tokenAddress: string;
+    readonly stage: string;
+    readonly reasonCode: string;
+    readonly decisionRuleVersion?: string;
+  }): boolean {
+    return this.database
+      .prepare(`
+        SELECT 1
+        FROM qualification_events
+        WHERE chain = ? AND token_address = ? AND stage = ? AND reason_code = ?
+          AND (? IS NULL OR decision_rule_version = ?)
+        LIMIT 1
+      `)
+      .get(
+        input.chain,
+        normalizeAddress(input.chain, input.tokenAddress),
+        input.stage,
+        input.reasonCode,
+        input.decisionRuleVersion ?? null,
+        input.decisionRuleVersion ?? null
+      ) !== undefined;
+  }
+
+  recordOnce(input: {
+    readonly chain: Chain;
+    readonly tokenAddress: string;
+    readonly stage: string;
+    readonly outcome: 'PASS' | 'WAIT' | 'REJECT' | 'ERROR';
+    readonly reasonCode: string;
+    readonly source: 'gmgn' | 'coingecko' | 'system';
+    readonly observedAtMs: number;
+    readonly raw: unknown;
+    readonly normalized: unknown;
+    readonly thresholds: unknown;
+    readonly decisionRuleVersion: string;
+  }, versionScoped = true): number | undefined {
+    const result = this.database.prepare(`
+      INSERT INTO qualification_events(
+        chain, token_address, stage, outcome, reason_code, source,
+        observed_at_ms, raw_json, normalized_json, thresholds_json,
+        decision_rule_version
+      )
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM qualification_events
+        WHERE chain = ? AND token_address = ? AND stage = ? AND reason_code = ?
+          AND (? = 0 OR decision_rule_version = ?)
+      )
+    `).run(
+      input.chain,
+      normalizeAddress(input.chain, input.tokenAddress),
+      input.stage,
+      input.outcome,
+      input.reasonCode,
+      input.source,
+      input.observedAtMs,
+      stableJsonStringify(input.raw),
+      stableJsonStringify(input.normalized),
+      stableJsonStringify(input.thresholds),
+      input.decisionRuleVersion,
+      input.chain,
+      normalizeAddress(input.chain, input.tokenAddress),
+      input.stage,
+      input.reasonCode,
+      versionScoped ? 1 : 0,
+      input.decisionRuleVersion
+    );
+    return result.changes === 1 ? Number(result.lastInsertRowid) : undefined;
+  }
+
+  hasRealPoolActivationEvidence(chain: Chain, tokenAddress: string): boolean {
+    return this.database.prepare(`
+      SELECT 1 FROM qualification_events
+      WHERE chain = ? AND token_address = ? AND stage = 'activation'
+        AND (substr(reason_code, -10) = '_REAL_POOL'
+          OR substr(reason_code, -13) = '_REVIVAL_POOL')
+      LIMIT 1
+    `).get(chain, normalizeAddress(chain, tokenAddress)) !== undefined;
+  }
+
   record(input: {
     readonly chain: Chain;
     readonly tokenAddress: string;
@@ -982,6 +1064,16 @@ export class QualificationEventRepository {
 
 export type OutboxStatus = 'PENDING' | 'SENDING' | 'SENT' | 'UNCERTAIN';
 
+export interface RadarInitialPayloadEnvelope {
+  readonly payload: {
+    readonly text: string;
+    readonly snapshot: unknown;
+  };
+  readonly sendRequestedAtMs: number;
+  readonly receiptAtMs: number;
+  readonly ruleVersion: string;
+}
+
 export interface OutboxRecord {
   readonly id: number;
   readonly chain: Chain;
@@ -996,6 +1088,7 @@ export interface OutboxRecord {
   readonly telegramMessageId: string | null;
   readonly lastError: string | null;
   readonly appliedPayloadHash: string | null;
+  readonly initialPayload: RadarInitialPayloadEnvelope | null;
 }
 
 interface OutboxRow {
@@ -1012,6 +1105,68 @@ interface OutboxRow {
   telegram_message_id: string | null;
   last_error: string | null;
   applied_payload_hash: string | null;
+  initial_payload_json: string | null;
+}
+
+function parseRadarInitialPayload(value: string | null): RadarInitialPayloadEnvelope | null {
+  if (value === null) return null;
+  const parsed = JSON.parse(value) as unknown;
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('radar initial payload envelope must be an object');
+  }
+  const envelope = parsed as Record<string, unknown>;
+  const payload = envelope.payload;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('radar initial payload must be an object');
+  }
+  const payloadRecord = payload as Record<string, unknown>;
+  const snapshot = payloadRecord.snapshot;
+  if (typeof payloadRecord.text !== 'string' || payloadRecord.text === '') {
+    throw new Error('radar initial payload text is required');
+  }
+  if (snapshot === null || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    throw new Error('radar initial payload snapshot is required');
+  }
+  const snapshotRecord = snapshot as Record<string, unknown>;
+  const validStages = new Set([
+    'bonding', 'real_pool', 'heat_wait', 'qualified', 'expired', 'rejected'
+  ]);
+  if (!validStages.has(String(snapshotRecord.stage))) {
+    throw new Error('radar initial payload stage is invalid');
+  }
+  const presentation = snapshotRecord.presentation;
+  if (presentation === null || typeof presentation !== 'object' || Array.isArray(presentation)) {
+    throw new Error('radar initial payload presentation is required');
+  }
+  const display = presentation as Record<string, unknown>;
+  if (
+    typeof display.marketCapUsd !== 'number' || !Number.isFinite(display.marketCapUsd) ||
+    typeof display.rank !== 'number' || !Number.isInteger(display.rank) || display.rank <= 0 ||
+    !['DUAL_RANK', 'THREE_RISING_1M', 'RADAR_OPENED'].includes(String(display.activationReason))
+  ) {
+    throw new Error('radar initial payload presentation is incomplete');
+  }
+  if (
+    typeof envelope.sendRequestedAtMs !== 'number' ||
+    !Number.isSafeInteger(envelope.sendRequestedAtMs) ||
+    envelope.sendRequestedAtMs < 0 ||
+    typeof envelope.receiptAtMs !== 'number' ||
+    !Number.isSafeInteger(envelope.receiptAtMs) ||
+    envelope.receiptAtMs < envelope.sendRequestedAtMs ||
+    typeof envelope.ruleVersion !== 'string' ||
+    envelope.ruleVersion.trim() === ''
+  ) {
+    throw new Error('radar initial payload envelope metadata is invalid');
+  }
+  return {
+    payload: {
+      text: payloadRecord.text,
+      snapshot
+    },
+    sendRequestedAtMs: envelope.sendRequestedAtMs,
+    receiptAtMs: envelope.receiptAtMs,
+    ruleVersion: envelope.ruleVersion
+  };
 }
 
 function toOutbox(row: OutboxRow): OutboxRecord {
@@ -1028,7 +1183,8 @@ function toOutbox(row: OutboxRow): OutboxRecord {
     receiptAtMs: row.receipt_at_ms,
     telegramMessageId: row.telegram_message_id,
     lastError: row.last_error,
-    appliedPayloadHash: row.applied_payload_hash
+    appliedPayloadHash: row.applied_payload_hash,
+    initialPayload: parseRadarInitialPayload(row.initial_payload_json)
   };
 }
 
@@ -1125,10 +1281,51 @@ export class OutboxRepository {
       .prepare(`
         UPDATE message_outbox
         SET status = 'SENT', telegram_message_id = ?, receipt_at_ms = ?, updated_at_ms = ?
-        WHERE id = ? AND status = 'SENDING'
+        WHERE id = ? AND message_kind = 'signal' AND status = 'SENDING'
       `)
       .run(telegramMessageId, receiptAtMs, receiptAtMs, id);
-    if (result.changes !== 1) throw new Error('outbox record is not sending');
+    if (result.changes !== 1) throw new Error('signal outbox record is not sending');
+    return this.findById(id)!;
+  }
+
+  markRadarSent(
+    id: number,
+    telegramMessageId: string,
+    receiptAtMs: number,
+    ruleVersion: string,
+    appliedPayloadHash: string
+  ): OutboxRecord {
+    if (telegramMessageId.trim() === '') throw new Error('Telegram message ID is required');
+    if (!Number.isSafeInteger(receiptAtMs) || receiptAtMs < 0) {
+      throw new RangeError('receiptAtMs must be a non-negative safe integer');
+    }
+    if (ruleVersion.trim() === '') throw new Error('ruleVersion is required');
+    if (appliedPayloadHash.trim() === '') throw new Error('appliedPayloadHash is required');
+    const result = this.database.prepare(`
+      UPDATE message_outbox
+      SET status = 'SENT', telegram_message_id = ?, receipt_at_ms = ?,
+          applied_payload_hash = ?,
+          initial_payload_json = json_object(
+            'payload', json(payload_json),
+            'sendRequestedAtMs', send_requested_at_ms,
+            'receiptAtMs', ?,
+            'ruleVersion', ?
+          ),
+          updated_at_ms = ?
+      WHERE id = ? AND message_kind = 'radar' AND status = 'SENDING'
+        AND send_requested_at_ms IS NOT NULL AND send_requested_at_ms <= ?
+        AND initial_payload_json IS NULL
+    `).run(
+      telegramMessageId,
+      receiptAtMs,
+      appliedPayloadHash,
+      receiptAtMs,
+      ruleVersion,
+      receiptAtMs,
+      id,
+      receiptAtMs
+    );
+    if (result.changes !== 1) throw new Error('radar outbox record is not sending');
     return this.findById(id)!;
   }
 

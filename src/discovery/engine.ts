@@ -172,8 +172,18 @@ export class CandidateDiscoveryEngine {
           const publicReady =
             dualCount >= DISCOVERY_POLICY.consecutiveDualSnapshotCount ||
             risingUpdate.activated.has(item.tokenAddress);
+          const radarOpened =
+            item.openAtMs !== null &&
+            (snapshot.chain === 'bsc'
+              ? this.events.has({
+                  chain: snapshot.chain,
+                  tokenAddress: item.tokenAddress,
+                  stage: 'bonding_shortcut_readiness',
+                  reasonCode: 'BONDING_POOL_OPEN_SHORTCUT_READY'
+                })
+              : candidate.status === 'RADAR');
           const reason =
-            candidate.status === 'RADAR' && item.openAtMs !== null
+            radarOpened
               ? 'RADAR_OPENED'
               : dualCount >= 1
                 ? 'DUAL_RANK'
@@ -376,11 +386,63 @@ export class CandidateDiscoveryEngine {
     ) return;
 
     if (info.openAtMs === null || info.biggestPoolAddress === null) {
-      const bondingPublic =
-        publicReady &&
-        latestOneMinute.rank <= DISCOVERY_POLICY.bondingRadarRankMax &&
+      const publicPolicy = DISCOVERY_POLICY.publicRadar[chain];
+      const bondingMarketCap =
         latestOneMinute.marketCapUsd >= DISCOVERY_POLICY.bondingRadarMarketCapUsd.min &&
         latestOneMinute.marketCapUsd <= DISCOVERY_POLICY.bondingRadarMarketCapUsd.max;
+      const shortcutReady =
+        chain === 'bsc' &&
+        publicReady &&
+        latestOneMinute.rank <= DISCOVERY_POLICY.bondingShortcutRankMax &&
+        bondingMarketCap;
+      if (shortcutReady) {
+        this.events.recordOnce({
+          chain,
+          tokenAddress: item.tokenAddress,
+          stage: 'bonding_shortcut_readiness',
+          outcome: 'PASS',
+          reasonCode: 'BONDING_POOL_OPEN_SHORTCUT_READY',
+          source: 'gmgn',
+          observedAtMs,
+          raw: info.raw,
+          normalized: {
+            rank: latestOneMinute.rank,
+            marketCapUsd: latestOneMinute.marketCapUsd
+          },
+          thresholds: {
+            rankMax: DISCOVERY_POLICY.bondingShortcutRankMax,
+            marketCapUsd: DISCOVERY_POLICY.bondingRadarMarketCapUsd
+          },
+          decisionRuleVersion: this.config.ruleVersion
+        }, false);
+      }
+      const bondingPublic =
+        publicReady &&
+        latestOneMinute.rank >= publicPolicy.bondingRank.min &&
+        latestOneMinute.rank <= publicPolicy.bondingRank.max &&
+        bondingMarketCap;
+      if (chain === 'bsc' && bondingPublic) {
+        this.events.recordOnce({
+          chain,
+          tokenAddress: item.tokenAddress,
+          stage: 'radar_public_readiness',
+          outcome: 'PASS',
+          reasonCode: 'BSC_RADAR_PUBLIC_READY',
+          source: 'gmgn',
+          observedAtMs,
+          raw: info.raw,
+          normalized: {
+            stage: 'bonding',
+            rank: latestOneMinute.rank,
+            marketCapUsd: latestOneMinute.marketCapUsd
+          },
+          thresholds: {
+            rank: publicPolicy.bondingRank,
+            marketCapUsd: DISCOVERY_POLICY.bondingRadarMarketCapUsd
+          },
+          decisionRuleVersion: this.config.ruleVersion
+        });
+      }
       if (eligible.status === 'DISCOVERED' && bondingPublic) {
         this.transitionWithEvent({
           chain,

@@ -9,6 +9,7 @@ import type {
   CoinGeckoTrade,
   FixedPoolBinding
 } from '../providers/coingecko.js';
+import { FixedPoolContractError } from '../providers/coingecko.js';
 import type { GmgnClient, GmgnTokenSecurity } from '../providers/gmgn.js';
 import {
   evaluateGmgnTokenSecurity,
@@ -236,6 +237,22 @@ export class EvaluationService {
         error.status === 404
       ) {
         this.markTerminal(sample, 'FIXED_POOL_MISSING');
+        return;
+      }
+      if (error instanceof FixedPoolContractError) {
+        if (error.reasonCode === 'LOCAL_POOL_IDENTITY_MISMATCH') {
+          this.suspendForCriticalError(sample.chain, error.reasonCode);
+          this.markTerminal(sample, error.reasonCode);
+          return;
+        }
+        withTransaction(this.database, () => {
+          this.repository.markFailure(
+            point,
+            this.safeError(error),
+            this.now(),
+            error.reasonCode
+          );
+        });
         return;
       }
       withTransaction(this.database, () => {

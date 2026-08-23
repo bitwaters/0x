@@ -520,7 +520,12 @@ export class EvaluationRepository {
       .run(firstSellAtMs, observedAtMs, sampleId);
   }
 
-  markFailure(point: EvaluationPointRecord, safeError: string, observedAtMs: number): boolean {
+  markFailure(
+    point: EvaluationPointRecord,
+    safeError: string,
+    observedAtMs: number,
+    reasonCode?: string
+  ): boolean {
     const current = this.database
       .prepare('SELECT retry_count FROM signal_evaluation_points WHERE id = ?')
       .get(point.id) as { retry_count: number };
@@ -528,12 +533,16 @@ export class EvaluationRepository {
       this.database
         .prepare(`
           UPDATE signal_evaluation_points
-          SET retry_count = 1, next_attempt_at_ms = ?, details_json = ?, updated_at_ms = ?
+          SET retry_count = 1, next_attempt_at_ms = ?,
+              details_json = json_patch(details_json, ?), updated_at_ms = ?
           WHERE id = ? AND status = 'PENDING'
         `)
         .run(
           observedAtMs + EVALUATION_POLICY.retryDelayMs,
-          stableJsonStringify({ providerError: safeError }),
+          stableJsonStringify({
+            ...(reasonCode === undefined ? {} : { reasonCode }),
+            providerError: safeError
+          }),
           observedAtMs,
           point.id
         );
@@ -542,12 +551,16 @@ export class EvaluationRepository {
     this.database
       .prepare(`
         UPDATE signal_evaluation_points
-        SET status = 'PROVIDER_MISSING', observed_at_ms = ?, details_json = ?, updated_at_ms = ?
+        SET status = 'PROVIDER_MISSING', observed_at_ms = ?,
+            details_json = json_patch(details_json, ?), updated_at_ms = ?
         WHERE id = ? AND status = 'PENDING'
       `)
       .run(
         observedAtMs,
-        stableJsonStringify({ providerError: safeError }),
+        stableJsonStringify({
+          ...(reasonCode === undefined ? {} : { reasonCode }),
+          providerError: safeError
+        }),
         observedAtMs,
         point.id
       );
@@ -562,12 +575,17 @@ export class EvaluationRepository {
       this.database
         .prepare(`
           UPDATE signal_evaluation_points
-          SET status = 'PROVIDER_MISSING', observed_at_ms = ?, details_json = ?, updated_at_ms = ?
+          SET status = 'PROVIDER_MISSING', observed_at_ms = ?,
+              details_json = json_patch(details_json, ?), updated_at_ms = ?
           WHERE sample_id = ? AND status = 'PENDING'
         `)
         .run(
           observedAtMs,
-          stableJsonStringify({ providerError: safeError, reason: 'entry_provider_missing' }),
+          stableJsonStringify({
+            ...(reasonCode === undefined ? {} : { reasonCode }),
+            providerError: safeError,
+            reason: 'entry_provider_missing'
+          }),
           observedAtMs,
           point.sampleId
         );

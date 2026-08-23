@@ -355,5 +355,46 @@ export const MIGRATIONS: readonly Migration[] = [
         FROM evaluation_reports_legacy;
       DROP TABLE evaluation_reports_legacy;
     `
+  },
+  {
+    version: 7,
+    name: 'immutable_radar_initial_payload',
+    sql: `
+      ALTER TABLE message_outbox ADD COLUMN initial_payload_json TEXT
+        CHECK(initial_payload_json IS NULL OR json_valid(initial_payload_json));
+
+      INSERT INTO qualification_events(
+        chain, token_address, stage, outcome, reason_code, source,
+        observed_at_ms, raw_json, normalized_json, thresholds_json,
+        decision_rule_version
+      )
+      SELECT e.chain, e.token_address,
+             'bonding_shortcut_readiness', 'PASS',
+             'BONDING_POOL_OPEN_SHORTCUT_READY', e.source,
+             e.observed_at_ms, e.raw_json, e.normalized_json, e.thresholds_json,
+             e.decision_rule_version
+      FROM qualification_events e
+      JOIN candidates c
+        ON c.chain = e.chain AND c.token_address = e.token_address
+      WHERE c.chain = 'bsc' AND c.status = 'RADAR'
+        AND e.stage = 'activation'
+        AND substr(e.reason_code, -14) = '_BONDING_CURVE'
+        AND e.id = (
+          SELECT e2.id
+          FROM qualification_events e2
+          WHERE e2.chain = e.chain AND e2.token_address = e.token_address
+            AND e2.stage = 'activation'
+            AND substr(e2.reason_code, -14) = '_BONDING_CURVE'
+          ORDER BY e2.observed_at_ms, e2.id
+          LIMIT 1
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM qualification_events x
+          WHERE x.chain = e.chain AND x.token_address = e.token_address
+            AND x.stage = 'bonding_shortcut_readiness'
+            AND x.reason_code = 'BONDING_POOL_OPEN_SHORTCUT_READY'
+        );
+    `
   }
 ] as const;

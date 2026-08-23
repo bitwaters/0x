@@ -25,6 +25,7 @@ import type {
   CoinGeckoPoolDetail,
   CoinGeckoTrade
 } from '../src/providers/coingecko.js';
+import { FixedPoolContractError } from '../src/providers/coingecko.js';
 import type { GmgnTokenSecurity } from '../src/providers/gmgn.js';
 import { ProviderRequestError } from '../src/providers/http.js';
 import type { DeliveredSignalSnapshot } from '../src/telegram/messages.js';
@@ -220,6 +221,8 @@ class MarketSource {
   bars: readonly CoinGeckoOhlcvBar[] = [];
   reserveUsd = 12_000;
   detailError: unknown;
+  tradeError: unknown;
+  ohlcvError: unknown;
   detailCalls = 0;
   tradeCalls = 0;
 
@@ -237,10 +240,12 @@ class MarketSource {
 
   async getPoolTrades(): Promise<readonly CoinGeckoTrade[]> {
     this.tradeCalls += 1;
+    if (this.tradeError !== undefined) throw this.tradeError;
     return this.trades;
   }
 
   async getPoolOhlcv(): Promise<readonly CoinGeckoOhlcvBar[]> {
+    if (this.ohlcvError !== undefined) throw this.ohlcvError;
     return this.bars;
   }
 }
@@ -549,6 +554,103 @@ test('pool disappearance is terminal while provider failure retries once and rem
   assert.equal(report.totalDelivered, 1);
   assert.equal(report.segments.find((segment) => segment.providerMissing === 1)!.coverage, 0);
   missingSetup.database.close();
+});
+
+test('evaluation suspends on local pool identity but finitely retries provider metadata conflict', async () => {
+  const localSetup = setupDatabase();
+  const localReceipt = 4_200_000;
+  const localSample = addSample(localSetup.database, localSetup.runtime, 41, localReceipt);
+  const localNow = { value: localReceipt + 13_000 };
+  const localMarket = new MarketSource(localNow);
+  localMarket.tradeError = new FixedPoolContractError(
+    'pool_trades', 'binding', 'LOCAL_POOL_IDENTITY_MISMATCH', 'fixture mismatch'
+  );
+  await new EvaluationService(
+    localSetup.database,
+    localSetup.runtime,
+    localMarket,
+    new SecuritySource(localNow),
+    () => localNow.value
+  ).tick();
+  const localState = new EvaluationRepository(localSetup.database).chainState('bsc');
+  assert.equal(localState.state, 'SUSPENDED');
+  assert.equal(localState.suspensionReason, 'LOCAL_POOL_IDENTITY_MISMATCH');
+  assert.ok(
+    (localSetup.database.prepare(`
+      SELECT status, details_json FROM signal_evaluation_points
+      WHERE sample_id = ?
+    `).all(localSample.id) as Array<{ status: string; details_json: string }>).every(
+      (point) => point.status === 'TERMINAL_NEGATIVE' &&
+        JSON.parse(point.details_json).reason === 'LOCAL_POOL_IDENTITY_MISMATCH'
+    )
+  );
+  localSetup.database.close();
+
+  const providerSetup = setupDatabase();
+  const providerReceipt = 4_300_000;
+  const providerSample = addSample(
+    providerSetup.database, providerSetup.runtime, 42, providerReceipt
+  );
+  markValidEntry(providerSetup.database, providerSample.id, providerReceipt);
+  providerSetup.database.prepare(`
+    UPDATE signal_evaluation_points
+    SET status = 'COMPLETE', observed_at_ms = scheduled_at_ms,
+        price_usd = 100, gross_return = 0, mfe = 0, mae = 0,
+        path_30_15 = 'NONE', path_2x_30 = 'NONE', source = 'TRADES',
+        granularity = 'trade', details_json = '{}'
+    WHERE sample_id = ? AND horizon_seconds IN (30, 60, 90)
+  `).run(providerSample.id);
+  const providerNow = { value: providerReceipt + 300_000 };
+  const providerMarket = new MarketSource(providerNow);
+  providerMarket.ohlcvError = new FixedPoolContractError(
+    'pool_ohlcv', 'meta.quote.address', 'PROVIDER_POOL_META_CONFLICT',
+    'fixture conflict'
+  );
+  const providerService = new EvaluationService(
+    providerSetup.database,
+    providerSetup.runtime,
+    providerMarket,
+    new SecuritySource(providerNow),
+    () => providerNow.value
+  );
+  await providerService.tick();
+  const providerPoint = providerSetup.database.prepare(`
+    SELECT status, retry_count, details_json FROM signal_evaluation_points
+    WHERE sample_id = ? AND horizon_seconds = 300
+  `).get(providerSample.id)!;
+  assert.deepEqual([providerPoint.status, providerPoint.retry_count], ['PENDING', 1]);
+  assert.equal(
+    JSON.parse(providerPoint.details_json as string).reasonCode,
+    'PROVIDER_POOL_META_CONFLICT'
+  );
+  providerNow.value += EVALUATION_POLICY.retryDelayMs;
+  await providerService.tick();
+  const failedOhlcv = providerSetup.database.prepare(`
+    SELECT status, price_usd, mfe, mae, path_30_15, path_2x_30, details_json
+    FROM signal_evaluation_points WHERE sample_id = ? AND horizon_seconds = 300
+  `).get(providerSample.id)!;
+  assert.equal(failedOhlcv.status, 'PROVIDER_MISSING');
+  assert.deepEqual(
+    [failedOhlcv.price_usd, failedOhlcv.mfe, failedOhlcv.mae,
+      failedOhlcv.path_30_15, failedOhlcv.path_2x_30],
+    [null, null, null, null, null]
+  );
+  assert.equal(
+    JSON.parse(failedOhlcv.details_json as string).reasonCode,
+    'PROVIDER_POOL_META_CONFLICT'
+  );
+  assert.equal(
+    providerSetup.database.prepare(`
+      SELECT status FROM signal_evaluation_points
+      WHERE sample_id = ? AND horizon_seconds = 900
+    `).get(providerSample.id)!.status,
+    'PENDING'
+  );
+  assert.equal(
+    new EvaluationRepository(providerSetup.database).chainState('bsc').state,
+    'VALIDATING'
+  );
+  providerSetup.database.close();
 });
 
 test('a saturated trades page missing the target boundary is provider missing', async () => {

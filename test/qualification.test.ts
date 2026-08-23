@@ -15,7 +15,11 @@ import {
   evaluateLiquidityStability,
   evaluateTradeWindow
 } from '../src/qualification/rules.js';
-import type { CoinGeckoPoolDetail, CoinGeckoTrade } from '../src/providers/coingecko.js';
+import {
+  FixedPoolContractError,
+  type CoinGeckoPoolDetail,
+  type CoinGeckoTrade
+} from '../src/providers/coingecko.js';
 import type {
   GmgnTrendingItem,
   GmgnTokenInfo,
@@ -461,6 +465,82 @@ test('a changed GMGN main pool terminates the fixed candidate and releases subsc
   const result = await service.refresh('bsc', TOKEN);
   assert.equal(result.outcome, 'REJECTED');
   assert.equal(candidates.find('bsc', TOKEN)!.terminalReason, 'MAIN_POOL_CHANGED');
+  assert.deepEqual(released, [POOL]);
+  database.close();
+});
+
+test('qualification closes a frozen binding whose returned direction changes', async () => {
+  const now = { value: 4_500_000 };
+  const { database, config, candidates } = qualificationSetup(now);
+  let side: 'base' | 'quote' = 'base';
+  const released: string[] = [];
+  const service = new FixedPoolQualificationService(
+    database,
+    config,
+    {
+      async getTrending() { return gmgnFacts(now.value).trending; },
+      async getTokenInfo() { return gmgnFacts(now.value).info; },
+      async getTokenSecurity() { return gmgnFacts(now.value).security; }
+    },
+    {
+      async getPoolDetail() { return detail(now.value, { side }); },
+      async getPoolTrades() { return []; }
+    },
+    () => now.value,
+    () => undefined,
+    (_chain, pool) => released.push(pool)
+  );
+  assert.equal((await service.refresh('bsc', TOKEN)).outcome, 'WAIT');
+  side = 'quote';
+  now.value += 10_000;
+  assert.equal((await service.refresh('bsc', TOKEN)).outcome, 'REJECTED');
+  assert.equal(
+    candidates.find('bsc', TOKEN)!.terminalReason,
+    'LOCAL_POOL_IDENTITY_MISMATCH'
+  );
+  assert.deepEqual(released, [POOL]);
+  database.close();
+});
+
+test('qualification rejects a local identity error raised while loading fixed-pool trades', async () => {
+  const now = { value: 4_750_000 };
+  const { database, config, candidates } = qualificationSetup(now);
+  const released: string[] = [];
+  const service = new FixedPoolQualificationService(
+    database,
+    config,
+    {
+      async getTrending() { return gmgnFacts(now.value).trending; },
+      async getTokenInfo() { return gmgnFacts(now.value).info; },
+      async getTokenSecurity() { return gmgnFacts(now.value).security; }
+    },
+    {
+      async getPoolDetail() { return detail(now.value); },
+      async getPoolTrades() {
+        throw new FixedPoolContractError(
+          'pool_trades', 'binding', 'LOCAL_POOL_IDENTITY_MISMATCH',
+          'fixture mismatch'
+        );
+      }
+    },
+    () => now.value,
+    () => undefined,
+    (_chain, pool) => released.push(pool)
+  );
+  assert.equal((await service.refresh('bsc', TOKEN)).outcome, 'WAIT');
+  now.value += 10_000;
+  assert.equal((await service.refresh('bsc', TOKEN)).outcome, 'REJECTED');
+  assert.equal(
+    candidates.find('bsc', TOKEN)!.terminalReason,
+    'LOCAL_POOL_IDENTITY_MISMATCH'
+  );
+  assert.equal(
+    database.prepare(`
+      SELECT count(*) AS count FROM qualification_events
+      WHERE reason_code = 'LOCAL_POOL_IDENTITY_MISMATCH'
+    `).get()!.count,
+    1
+  );
   assert.deepEqual(released, [POOL]);
   database.close();
 });

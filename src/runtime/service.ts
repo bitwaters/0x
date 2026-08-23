@@ -323,40 +323,115 @@ export class BotRuntime {
         latest !== undefined &&
         latest.fetchedAtMs === currentFetchAt &&
         nowMs - latest.fetchedAtMs <= DISCOVERY_POLICY.snapshotMaxAgeMs['1m'];
+      const publicPolicy = DISCOVERY_POLICY.publicRadar[candidate.chain];
       const bondingPublic =
         candidate.status === 'RADAR' &&
         latestFresh &&
-        latest.rank <= DISCOVERY_POLICY.bondingRadarRankMax &&
+        latest.rank >= publicPolicy.bondingRank.min &&
+        latest.rank <= publicPolicy.bondingRank.max &&
           latest.marketCapUsd >= DISCOVERY_POLICY.bondingRadarMarketCapUsd.min &&
           latest.marketCapUsd <= DISCOVERY_POLICY.bondingRadarMarketCapUsd.max;
+      const opportunityPublic =
+        candidate.chain === 'sol' ||
+        candidate.opportunityType === 'new_pool' ||
+        (candidate.opportunityType === 'revival' && publicPolicy.revivalPublic);
+      const activationEvidence =
+        candidate.chain === 'sol' ||
+        (candidate.activationAtMs !== null &&
+          this.qualificationEvents.hasRealPoolActivationEvidence(
+            candidate.chain,
+            candidate.tokenAddress
+          ));
       const realPoolPublic =
         ['PREHEAT', 'POOL_BOUND', 'MONITORING'].includes(candidate.status) &&
+        activationEvidence &&
+        opportunityPublic &&
         latestFresh &&
-        latest.rank <= DISCOVERY_POLICY.realPoolRankMax &&
+        latest.rank >= publicPolicy.realPoolRank.min &&
+        latest.rank <= publicPolicy.realPoolRank.max &&
         latest.marketCapUsd >= DISCOVERY_POLICY.realPoolMarketCapUsd.min &&
         latest.marketCapUsd <= DISCOVERY_POLICY.realPoolMarketCapUsd.max &&
         latest.liquidityUsd !== null &&
         latest.liquidityUsd >= this.config.thresholds.liquidityMinUsd;
-      const stage: RadarMessageSnapshot['stage'] | undefined =
+      if (candidate.chain === 'bsc' && realPoolPublic && existing?.status !== 'SENT') {
+        this.qualificationEvents.recordOnce({
+          chain: candidate.chain,
+          tokenAddress: candidate.tokenAddress,
+          stage: 'radar_public_readiness',
+          outcome: 'PASS',
+          reasonCode: 'BSC_RADAR_PUBLIC_READY',
+          source: 'gmgn',
+          observedAtMs: latest!.fetchedAtMs,
+          raw: latest!.raw,
+          normalized: {
+            stage: 'real_pool',
+            opportunityType: candidate.opportunityType,
+            rank: latest!.rank,
+            marketCapUsd: latest!.marketCapUsd,
+            liquidityUsd: latest!.liquidityUsd,
+            activationAtMs: candidate.activationAtMs
+          },
+          thresholds: {
+            rank: publicPolicy.realPoolRank,
+            marketCapUsd: DISCOVERY_POLICY.realPoolMarketCapUsd,
+            liquidityMinUsd: this.config.thresholds.liquidityMinUsd,
+            revivalPublic: publicPolicy.revivalPublic
+          },
+          decisionRuleVersion: this.config.ruleVersion
+        });
+      }
+      const terminalStage: RadarMessageSnapshot['stage'] | undefined =
         candidate.status === 'SIGNAL_SENT'
           ? 'qualified'
           : candidate.status === 'EXPIRED'
             ? 'expired'
             : candidate.status === 'REJECTED'
               ? 'rejected'
-              : realPoolPublic
-                ? 'real_pool'
-                : bondingPublic
-                  ? 'bonding'
-                  : existing !== undefined
-                    ? 'heat_wait'
-                    : undefined;
+              : undefined;
+      const revivalSuppressed =
+        candidate.opportunityType === 'revival' && !publicPolicy.revivalPublic;
+      let stage: RadarMessageSnapshot['stage'] | undefined =
+        terminalStage ??
+        (revivalSuppressed
+          ? undefined
+          : realPoolPublic
+            ? 'real_pool'
+            : bondingPublic
+              ? 'bonding'
+              : (candidate.chain === 'bsc'
+                  ? existing?.status === 'SENT'
+                  : existing !== undefined)
+                ? 'heat_wait'
+                : undefined);
+      if (candidate.chain === 'bsc' && existing?.status !== 'SENT') {
+        const initialPublic = stage === 'bonding' || stage === 'real_pool';
+        const ready = this.qualificationEvents.has({
+          chain: candidate.chain,
+          tokenAddress: candidate.tokenAddress,
+          stage: 'radar_public_readiness',
+          reasonCode: 'BSC_RADAR_PUBLIC_READY',
+          decisionRuleVersion: this.config.ruleVersion
+        });
+        if (!initialPublic || !ready) stage = undefined;
+      }
       if (stage === undefined) continue;
+      const waitReason =
+        stage === 'heat_wait' &&
+        candidate.chain === 'bsc' &&
+        latestFresh &&
+        (candidate.status === 'RADAR'
+          ? latest!.rank < publicPolicy.bondingRank.min ||
+            latest!.rank > publicPolicy.bondingRank.max
+          : latest!.rank < publicPolicy.realPoolRank.min ||
+            latest!.rank > publicPolicy.realPoolRank.max)
+          ? 'outside_public_range' as const
+          : undefined;
       const result = await this.deliverRadar(
         candidate,
         latestFresh ? latest : undefined,
         existing?.payload,
-        stage
+        stage,
+        waitReason
       );
       if (
         result === undefined ||
@@ -379,7 +454,8 @@ export class BotRuntime {
     candidate: CandidateRecord,
     latestRank: ReturnType<RankSnapshotRepository['findLatest']>,
     existingPayload: unknown,
-    stage: RadarMessageSnapshot['stage']
+    stage: RadarMessageSnapshot['stage'],
+    waitReason?: RadarMessageSnapshot['waitReason']
   ): Promise<DeliveryResult | undefined> {
     const raw =
       latestRank?.raw !== null && typeof latestRank?.raw === 'object' && !Array.isArray(latestRank.raw)
@@ -404,6 +480,7 @@ export class BotRuntime {
       marketCapUsd: candidate.firstSeenMarketCapUsd,
       sampledMaxGain: candidate.sampledMaxGain,
       stage,
+      ...(waitReason === undefined ? {} : { waitReason }),
       ...(latestRank !== undefined &&
       typeof name === 'string' &&
       typeof symbol === 'string' &&

@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
   CoinGeckoClient,
+  FixedPoolContractError,
   hasFreshTrade,
   nextOhlcvBeforeTimestamp
 } from '../src/providers/coingecko.js';
@@ -539,7 +540,9 @@ test('CoinGecko rejects partially or fully swapped forged pool bindings before f
         baseTokenAddress: BSC_TOKEN,
         quoteTokenAddress: BSC_COUNTER
       }),
-    /verified pool detail/
+    (error: unknown) =>
+      error instanceof FixedPoolContractError &&
+      error.reasonCode === 'LOCAL_POOL_IDENTITY_MISMATCH'
   );
   await assert.rejects(
     () =>
@@ -552,9 +555,45 @@ test('CoinGecko rejects partially or fully swapped forged pool bindings before f
         baseTokenAddress: BSC_COUNTER,
         quoteTokenAddress: BSC_TOKEN
       }),
-    /verified pool detail/
+    (error: unknown) =>
+      error instanceof FixedPoolContractError &&
+      error.reasonCode === 'LOCAL_POOL_IDENTITY_MISMATCH'
   );
   assert.equal(calls, 0);
+});
+
+test('CoinGecko classifies contradictory fixed-pool OHLCV metadata as provider conflict', async () => {
+  const conflictingQuote = '0x0000000000000000000000000000000000000004';
+  const mock = sequenceFetcher([
+    jsonResponse(poolFixture('base')),
+    jsonResponse({
+      data: {
+        id: 'opaque-do-not-parse-as-identity',
+        type: 'ohlcv_request_response',
+        attributes: { ohlcv_list: [[1_787_427_000, 1, 1.2, 0.9, 1.1, 100]] }
+      },
+      meta: {
+        base: { address: BSC_TOKEN },
+        quote: { address: conflictingQuote }
+      }
+    })
+  ]);
+  const client = new CoinGeckoClient('cg-secret', {
+    fetcher: mock.fetcher,
+    wait: async () => undefined,
+    restBudget: isolatedRestBudget()
+  });
+  const binding = await client.getPoolDetail('bsc', BSC_POOL, BSC_TOKEN);
+  await assert.rejects(
+    () => client.getPoolOhlcv({ binding, timeframe: 'minute', aggregate: 1 }),
+    (error: unknown) =>
+      error instanceof FixedPoolContractError &&
+      error.reasonCode === 'PROVIDER_POOL_META_CONFLICT'
+  );
+  assert.equal(mock.requests.length, 2);
+  assert.match(mock.requests[1]!.url.pathname, new RegExp(`/pools/${BSC_POOL}/ohlcv/minute$`));
+  assert.equal(mock.requests[1]!.url.searchParams.get('token'), 'base');
+  assert.doesNotMatch(mock.requests[1]!.url.pathname, /tokens/);
 });
 
 test('CoinGecko default clients share one process REST budget', () => {

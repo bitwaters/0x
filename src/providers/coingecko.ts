@@ -20,6 +20,22 @@ export const COINGECKO_NETWORK: Readonly<Record<Chain, string>> = {
 
 export type CandidateSide = 'base' | 'quote';
 
+export type FixedPoolContractReason =
+  | 'LOCAL_POOL_IDENTITY_MISMATCH'
+  | 'PROVIDER_POOL_META_CONFLICT';
+
+export class FixedPoolContractError extends ContractError {
+  constructor(
+    operation: string,
+    field: string,
+    readonly reasonCode: FixedPoolContractReason,
+    message: string
+  ) {
+    super('coingecko', operation, field, message);
+    this.name = 'FixedPoolContractError';
+  }
+}
+
 export interface FixedPoolBinding {
   readonly chain: Chain;
   readonly poolAddress: string;
@@ -65,20 +81,20 @@ function validateFixedPoolBinding(
   const candidateIsBase = candidateTokenAddress === baseTokenAddress;
   const candidateIsQuote = candidateTokenAddress === quoteTokenAddress;
   if (candidateIsBase === candidateIsQuote) {
-    throw new ContractError(
-      'coingecko',
+    throw new FixedPoolContractError(
       operation,
       'binding.pool_composition',
+      'LOCAL_POOL_IDENTITY_MISMATCH',
       'candidate must match exactly one pool side'
     );
   }
   const expectedSide: CandidateSide = candidateIsBase ? 'base' : 'quote';
   const expectedCounter = candidateIsBase ? quoteTokenAddress : baseTokenAddress;
   if (binding.candidateSide !== expectedSide || counterTokenAddress !== expectedCounter) {
-    throw new ContractError(
-      'coingecko',
+    throw new FixedPoolContractError(
       operation,
       'binding.pool_composition',
+      'LOCAL_POOL_IDENTITY_MISMATCH',
       'candidate side or counter token does not match the fixed pool'
     );
   }
@@ -469,10 +485,10 @@ export class CoinGeckoClient {
         stringValue('coingecko', operation, `meta.${side}.address`, metaSide.address)
       );
       if (metaAddress !== fixed[`${side}TokenAddress`]) {
-        throw new ContractError(
-          'coingecko',
+        throw new FixedPoolContractError(
           operation,
           `meta.${side}.address`,
+          'PROVIDER_POOL_META_CONFLICT',
           'does not match the fixed pool'
         );
       }
@@ -557,10 +573,10 @@ export class CoinGeckoClient {
 
   private assertVerifiedBinding(operation: string, binding: FixedPoolBinding): void {
     if (!this.verifiedBindings.has(binding)) {
-      throw new ContractError(
-        'coingecko',
+      throw new FixedPoolContractError(
         operation,
         'binding',
+        'LOCAL_POOL_IDENTITY_MISMATCH',
         'must come from this client\'s verified pool detail'
       );
     }

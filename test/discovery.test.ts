@@ -29,13 +29,14 @@ function address(index: number): string {
 function trendingItem(input: {
   token: string;
   rank: number;
+  chain?: 'sol' | 'bsc';
   price?: number;
   marketCap?: number;
   liquidity?: number;
   openAtMs?: number | null;
 }): GmgnTrendingItem {
   return {
-    chain: 'bsc',
+    chain: input.chain ?? 'bsc',
     tokenAddress: input.token,
     name: 'Test Meme',
     symbol: 'TME',
@@ -59,10 +60,11 @@ function trendingItem(input: {
 function snapshot(
   interval: '1m' | '5m',
   fetchedAtMs: number,
-  items: readonly GmgnTrendingItem[]
+  items: readonly GmgnTrendingItem[],
+  chain: 'sol' | 'bsc' = 'bsc'
 ): GmgnTrendingSnapshot {
   return {
-    chain: 'bsc',
+    chain,
     interval,
     fetchedAtMs,
     filters: ['not_honeypot', 'verified', 'renounced'],
@@ -73,6 +75,7 @@ function snapshot(
 function tokenInfo(input: {
   token: string;
   fetchedAtMs: number;
+  chain?: 'sol' | 'bsc';
   pool?: string | null;
   openAtMs?: number | null;
   poolCreatedAtMs?: number | null;
@@ -81,7 +84,7 @@ function tokenInfo(input: {
   const pool = input.pool === undefined ? address(900) : input.pool;
   const openAtMs = input.openAtMs === undefined ? input.fetchedAtMs - 60_000 : input.openAtMs;
   return {
-    chain: 'bsc',
+    chain: input.chain ?? 'bsc',
     tokenAddress: input.token,
     biggestPoolAddress: pool,
     priceUsd: 0.001,
@@ -165,9 +168,9 @@ test('three-rising activation resets on a missing successful snapshot', async ()
     [10_000, 30, true],
     [13_000, 20, true],
     [16_000, 0, false],
-    [19_000, 15, true],
-    [22_000, 10, true],
-    [25_000, 5, true]
+    [19_000, 19, true],
+    [22_000, 12, true],
+    [25_000, 7, true]
   ] as const) {
     now.value = time;
     const result = await engine.acceptSnapshot(
@@ -202,23 +205,23 @@ test('consecutive dual-rank activation resets when a successful 1m snapshot omit
     })
   );
 
-  await engine.acceptSnapshot(snapshot('1m', 1_000, [trendingItem({ token, rank: 5 })]));
+  await engine.acceptSnapshot(snapshot('1m', 1_000, [trendingItem({ token, rank: 7 })]));
   now.value = 1_001;
-  await engine.acceptSnapshot(snapshot('5m', 1_001, [trendingItem({ token, rank: 5 })]));
+  await engine.acceptSnapshot(snapshot('5m', 1_001, [trendingItem({ token, rank: 7 })]));
   now.value = 4_000;
   await engine.acceptSnapshot(snapshot('1m', 4_000, []));
   now.value = 11_000;
-  await engine.acceptSnapshot(snapshot('5m', 11_000, [trendingItem({ token, rank: 5 })]));
+  await engine.acceptSnapshot(snapshot('5m', 11_000, [trendingItem({ token, rank: 7 })]));
   now.value = 11_001;
-  await engine.acceptSnapshot(snapshot('1m', 11_001, [trendingItem({ token, rank: 5 })]));
+  await engine.acceptSnapshot(snapshot('1m', 11_001, [trendingItem({ token, rank: 7 })]));
   assert.equal(candidates.find('bsc', token)!.status, 'DISCOVERED');
 
   now.value = 21_000;
-  await engine.acceptSnapshot(snapshot('5m', 21_000, [trendingItem({ token, rank: 5 })]));
+  await engine.acceptSnapshot(snapshot('5m', 21_000, [trendingItem({ token, rank: 7 })]));
   now.value = 21_001;
-  await engine.acceptSnapshot(snapshot('1m', 21_001, [trendingItem({ token, rank: 5 })]));
+  await engine.acceptSnapshot(snapshot('1m', 21_001, [trendingItem({ token, rank: 7 })]));
   now.value = 31_001;
-  await engine.acceptSnapshot(snapshot('1m', 31_001, [trendingItem({ token, rank: 5 })]));
+  await engine.acceptSnapshot(snapshot('1m', 31_001, [trendingItem({ token, rank: 7 })]));
   assert.equal(candidates.find('bsc', token)!.status, 'RADAR');
   database.close();
 });
@@ -252,9 +255,12 @@ test('real-pool activation waits on low liquidity while old pools can revive and
     }
     return tokenInfo({ token, fetchedAtMs: now.value });
   });
-  const items = [good, lowLiquidity, oldPool, bonding].map((token, rank) =>
-    trendingItem({ token, rank: rank + 1, marketCap: rank === 0 ? 300_000 : 100_000 })
-  );
+  const items = [
+    trendingItem({ token: good, rank: 1, marketCap: 300_000 }),
+    trendingItem({ token: lowLiquidity, rank: 2 }),
+    trendingItem({ token: oldPool, rank: 3 }),
+    trendingItem({ token: bonding, rank: 7 })
+  ];
   await engine.acceptSnapshot(snapshot('1m', now.value - 1_000, items));
   await engine.acceptSnapshot(snapshot('5m', now.value, items));
   now.value += 10_000;
@@ -266,6 +272,102 @@ test('real-pool activation waits on low liquidity while old pools can revive and
   assert.equal(candidates.find('bsc', oldPool)!.status, 'PREHEAT');
   assert.equal(candidates.find('bsc', oldPool)!.opportunityType, 'revival');
   assert.equal(candidates.find('bsc', bonding)!.status, 'RADAR');
+  database.close();
+});
+
+test('BSC keeps the Top3 pool-open shortcut internal while Top7 public radar grants no shortcut', async () => {
+  const now = { value: 2_100_000_000 };
+  const top3 = address(14);
+  const top7 = address(15);
+  let poolsOpen = false;
+  const { database, engine, candidates } = setup(now, (token) =>
+    tokenInfo({
+      token,
+      fetchedAtMs: now.value,
+      pool: poolsOpen ? address(token === top3 ? 914 : 915) : null,
+      openAtMs: poolsOpen ? now.value - 60_000 : null,
+      poolCreatedAtMs: poolsOpen ? now.value - 60_000 : null,
+      liquidity: poolsOpen ? 15_000 : 0
+    })
+  );
+  const items = [
+    trendingItem({ token: top3, rank: 3 }),
+    trendingItem({ token: top7, rank: 7 })
+  ];
+
+  await engine.acceptSnapshot(snapshot('1m', now.value, items));
+  now.value += 1;
+  await engine.acceptSnapshot(snapshot('5m', now.value, items));
+  now.value += 10_000;
+  await engine.acceptSnapshot(snapshot('1m', now.value, items));
+
+  assert.equal(candidates.find('bsc', top3)!.status, 'DISCOVERED');
+  assert.equal(candidates.find('bsc', top7)!.status, 'RADAR');
+  const shortcuts = database.prepare(`
+    SELECT token_address FROM qualification_events
+    WHERE stage = 'bonding_shortcut_readiness'
+    ORDER BY token_address
+  `).all() as Array<{ token_address: string }>;
+  assert.deepEqual(shortcuts.map((row) => row.token_address), [top3]);
+
+  poolsOpen = true;
+  now.value += 10_000;
+  const openedItems = items.map((item) => ({ ...item, openAtMs: now.value - 60_000 }));
+  await engine.acceptSnapshot(snapshot('1m', now.value, openedItems));
+  assert.equal(candidates.find('bsc', top3)!.status, 'PREHEAT');
+  assert.equal(candidates.find('bsc', top7)!.status, 'RADAR');
+  now.value += 1;
+  await engine.acceptSnapshot(snapshot('5m', now.value, openedItems));
+  assert.equal(candidates.find('bsc', top7)!.status, 'PREHEAT');
+  const reasons = database.prepare(`
+    SELECT token_address, reason_code FROM qualification_events
+    WHERE stage = 'activation' AND outcome = 'PASS'
+  `).all() as Array<{ token_address: string; reason_code: string }>;
+  assert.equal(
+    reasons.find((row) => row.token_address === top3)!.reason_code,
+    'RADAR_OPENED_REAL_POOL'
+  );
+  assert.notEqual(
+    reasons.find((row) => row.token_address === top7)!.reason_code,
+    'RADAR_OPENED_REAL_POOL'
+  );
+  database.close();
+});
+
+test('SOL keeps its Top5 public radar and status-based pool-open shortcut', async () => {
+  const now = { value: 2_200_000_000 };
+  const token = 'So11111111111111111111111111111111111111112';
+  let poolOpen = false;
+  const { database, engine, candidates } = setup(now, () =>
+    tokenInfo({
+      chain: 'sol', token, fetchedAtMs: now.value,
+      pool: poolOpen ? '11111111111111111111111111111111' : null,
+      openAtMs: poolOpen ? now.value - 60_000 : null,
+      poolCreatedAtMs: poolOpen ? now.value - 60_000 : null,
+      liquidity: poolOpen ? 15_000 : 0
+    })
+  );
+  const item = trendingItem({ chain: 'sol', token, rank: 5 });
+  await engine.acceptSnapshot(snapshot('1m', now.value, [item], 'sol'));
+  now.value += 1;
+  await engine.acceptSnapshot(snapshot('5m', now.value, [item], 'sol'));
+  now.value += 10_000;
+  await engine.acceptSnapshot(snapshot('1m', now.value, [item], 'sol'));
+  assert.equal(candidates.find('sol', token)!.status, 'RADAR');
+
+  poolOpen = true;
+  now.value += 10_000;
+  await engine.acceptSnapshot(
+    snapshot('1m', now.value, [{ ...item, openAtMs: now.value - 60_000 }], 'sol')
+  );
+  assert.equal(candidates.find('sol', token)!.status, 'PREHEAT');
+  assert.equal(
+    database.prepare(`
+      SELECT reason_code FROM qualification_events
+      WHERE chain = 'sol' AND stage = 'activation' AND outcome = 'PASS'
+    `).get()!.reason_code,
+    'RADAR_OPENED_REAL_POOL'
+  );
   database.close();
 });
 

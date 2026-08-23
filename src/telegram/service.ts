@@ -19,6 +19,7 @@ import type { SendEligibilitySnapshot } from '../qualification/snapshot.js';
 import { evaluateLiquiditySample, evaluateTradeWindow } from '../qualification/rules.js';
 import { QUALIFICATION_POLICY } from '../qualification/policy.js';
 import type { CoinGeckoClient, CoinGeckoPoolDetail, CoinGeckoTrade } from '../providers/coingecko.js';
+import { FixedPoolContractError } from '../providers/coingecko.js';
 import type {
   GmgnClient,
   GmgnTokenSecurity,
@@ -145,9 +146,10 @@ export class TelegramDeliveryService {
     return this.singleFlight(`radar:${snapshot.chain}:${token}`, async () => {
       const existing = this.outbox.find(snapshot.chain, token, 'radar');
       const requestedAtMs = this.now();
-      const card = renderRadarCard({ ...snapshot, tokenAddress: token });
+      const normalizedSnapshot = { ...snapshot, tokenAddress: token };
+      const card = renderRadarCard(normalizedSnapshot);
       const { text } = card;
-      const payload = { text, snapshot: { ...snapshot, tokenAddress: token } };
+      const payload = { text, snapshot: normalizedSnapshot };
       const desiredHash = this.payloadHash(payload);
       if (existing?.status === 'SENT') {
         if (existing.telegramMessageId === null) return { outcome: 'UNCERTAIN' };
@@ -198,6 +200,9 @@ export class TelegramDeliveryService {
       if (existing !== undefined && existing.status !== 'PENDING') {
         return { outcome: 'DUPLICATE' };
       }
+      if (!this.hasCompleteRadarPresentation(normalizedSnapshot)) {
+        return { outcome: 'SUPPRESSED', reason: 'RADAR_INITIAL_PRESENTATION_MISSING' };
+      }
       const record =
         existing ??
         this.outbox.createOrGet({
@@ -211,18 +216,34 @@ export class TelegramDeliveryService {
       if (record.status !== 'PENDING') return { outcome: 'DUPLICATE' };
       this.outbox.updatePendingPayload(record.id, payload, requestedAtMs);
       this.outbox.claim(record.id, requestedAtMs);
+      let receipt;
       try {
-        const receipt = await this.telegram.sendMessage(
+        receipt = await this.telegram.sendMessage(
           this.chatId('radar'),
           text,
           signal,
           card.options
         );
-        this.outbox.markSent(record.id, receipt.messageId, this.now());
-        this.outbox.markPayloadApplied(record.id, desiredHash, this.now());
-        return { outcome: 'SENT' };
       } catch (error) {
         return this.handleSendFailure(record.id, error);
+      }
+      const receiptAtMs = Math.max(this.now(), requestedAtMs);
+      try {
+        this.outbox.markRadarSent(
+          record.id,
+          receipt.messageId,
+          receiptAtMs,
+          this.config.ruleVersion,
+          desiredHash
+        );
+        return { outcome: 'SENT' };
+      } catch (error) {
+        try {
+          this.outbox.markUncertain(record.id, 'post_send_persistence_failed', receiptAtMs);
+        } catch {
+          // A committed SENT row is already non-retryable; preserve it as-is.
+        }
+        return { outcome: 'UNCERTAIN', reason: this.safeError(error) };
       }
     });
   }
@@ -379,7 +400,11 @@ export class TelegramDeliveryService {
         }
       );
       if (!this.samePoolComposition(eligibility, verifiedPool)) {
-        return { outcome: 'SUPPRESSED', reason: 'POOL_COMPOSITION_CHANGED' };
+        return this.rejectLocalPoolIdentity(
+          chain,
+          token,
+          'verified pool composition differs from eligibility snapshot'
+        );
       }
       const preSendLiquidity = evaluateLiquiditySample(
         verifiedPool,
@@ -402,6 +427,12 @@ export class TelegramDeliveryService {
       }
       preSendTrades = evaluateTradeWindow(trades, this.now());
     } catch (error) {
+      if (
+        error instanceof FixedPoolContractError &&
+        error.reasonCode === 'LOCAL_POOL_IDENTITY_MISMATCH'
+      ) {
+        return this.rejectLocalPoolIdentity(chain, token, error.message);
+      }
       return { outcome: 'SUPPRESSED', reason: this.safeError(error) };
     }
     if (
@@ -657,6 +688,38 @@ export class TelegramDeliveryService {
     });
   }
 
+  private rejectLocalPoolIdentity(
+    chain: Chain,
+    tokenAddress: string,
+    detail: string
+  ): DeliveryResult {
+    const atMs = this.now();
+    withTransaction(this.database, () => {
+      const candidate = this.candidates.find(chain, tokenAddress);
+      if (candidate !== undefined && !['SIGNAL_SENT', 'REJECTED', 'EXPIRED'].includes(candidate.status)) {
+        this.candidates.transition(chain, tokenAddress, 'REJECTED', {
+          atMs,
+          terminalReason: 'LOCAL_POOL_IDENTITY_MISMATCH'
+        });
+        this.events.record({
+          chain,
+          tokenAddress,
+          stage: 'telegram_pre_send',
+          outcome: 'REJECT',
+          reasonCode: 'LOCAL_POOL_IDENTITY_MISMATCH',
+          source: 'system',
+          observedAtMs: atMs,
+          raw: {},
+          normalized: { detail },
+          thresholds: {},
+          decisionRuleVersion: this.config.ruleVersion
+        });
+      }
+    });
+    this.releasePool(chain, tokenAddress);
+    return { outcome: 'SUPPRESSED', reason: 'LOCAL_POOL_IDENTITY_MISMATCH' };
+  }
+
   private async flushEdit(
     chain: Chain,
     tokenAddress: string,
@@ -748,6 +811,19 @@ export class TelegramDeliveryService {
 
   private payloadHash(payload: unknown): string {
     return createHash('sha256').update(stableJsonStringify(payload)).digest('hex');
+  }
+
+  private hasCompleteRadarPresentation(snapshot: RadarMessageSnapshot): boolean {
+    const display = snapshot.presentation;
+    return (
+      display !== undefined &&
+      display.name.trim() !== '' &&
+      display.symbol.trim() !== '' &&
+      Number.isFinite(display.marketCapUsd) &&
+      Number.isInteger(display.rank) &&
+      display.rank > 0 &&
+      ['DUAL_RANK', 'THREE_RISING_1M', 'RADAR_OPENED'].includes(display.activationReason)
+    );
   }
 
   private async withDeadline<T>(

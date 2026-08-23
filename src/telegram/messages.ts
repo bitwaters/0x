@@ -23,6 +23,7 @@ export interface RadarMessageSnapshot {
     | 'qualified'
     | 'expired'
     | 'rejected';
+  readonly waitReason?: 'outside_public_range';
   readonly presentation?: TokenPresentationSnapshot;
 }
 
@@ -236,7 +237,9 @@ export function renderRadarMessage(snapshot: RadarMessageSnapshot): string {
   const stage = {
     bonding: '⚪ 非正式 · Bonding Curve 观察中',
     real_pool: '🔵 非正式 · 真实池验证中',
-    heat_wait: '🟠 非正式 · 热度暂时不足，保留内部观察',
+    heat_wait: snapshot.waitReason === 'outside_public_range'
+      ? '🟠 非正式 · 当前不在公开观察区间，保留内部观察'
+      : '🟠 非正式 · 热度暂时不足，保留内部观察',
     qualified: '✅ 已通过正式资格',
     expired: '⌛ 真实池验证已超时',
     rejected: '⛔ 已停止观察'

@@ -13,7 +13,11 @@ import {
 } from '../src/db/repositories.js';
 import type { SendEligibilitySnapshot } from '../src/qualification/snapshot.js';
 import { evaluateLiquidityStability, evaluateTradeWindow } from '../src/qualification/rules.js';
-import type { CoinGeckoPoolDetail, CoinGeckoTrade } from '../src/providers/coingecko.js';
+import {
+  FixedPoolContractError,
+  type CoinGeckoPoolDetail,
+  type CoinGeckoTrade
+} from '../src/providers/coingecko.js';
 import type { GmgnTokenSecurity, GmgnTrendingSnapshot } from '../src/providers/gmgn.js';
 import { ProviderRequestError } from '../src/providers/http.js';
 import { EvaluationRepository } from '../src/evaluation/repository.js';
@@ -387,12 +391,62 @@ test('routes radar only to the radar channel and labels it non-formal', async ()
     firstSeenAtMs: now.value - 20_000,
     marketCapUsd: 80_000,
     sampledMaxGain: 0.5,
-    stage: 'real_pool'
+    stage: 'real_pool',
+    presentation: {
+      name: 'Test Meme', symbol: 'TME', marketCapUsd: 80_000,
+      rank: 7, currentGain: 0.25, activationReason: 'DUAL_RANK'
+    }
   });
   assert.equal(result.outcome, 'SENT');
   assert.equal(telegram.sends[0]!.chatId, '-1001');
   assert.match(telegram.sends[0]!.text, /非正式/);
   assert.deepEqual(telegram.sends[0]!.options, telegramCardOptions('bsc', TOKEN));
+  const outbox = new OutboxRepository(state.database).find('bsc', TOKEN, 'radar')!;
+  assert.deepEqual(outbox.initialPayload?.payload, outbox.payload);
+  assert.equal(outbox.initialPayload?.ruleVersion, state.config.ruleVersion);
+  state.database.close();
+});
+
+test('radar first send requires complete rank, market-cap and activation presentation', async () => {
+  const now = { value: 9_550_000 };
+  const state = setup(now);
+  const telegram = new FakeTelegram();
+  const delivery = service({ now, setup: state, telegram, price: { value: 100 } });
+  assert.deepEqual(await delivery.sendRadar({
+    chain: 'bsc', tokenAddress: TOKEN, firstSeenAtMs: now.value - 20_000,
+    marketCapUsd: 80_000, sampledMaxGain: 0.5, stage: 'bonding'
+  }), {
+    outcome: 'SUPPRESSED', reason: 'RADAR_INITIAL_PRESENTATION_MISSING'
+  });
+  assert.equal(telegram.sends.length, 0);
+  assert.equal(new OutboxRepository(state.database).find('bsc', TOKEN, 'radar'), undefined);
+  state.database.close();
+});
+
+test('radar receipt remains SENT when the wall clock moves backward during Telegram send', async () => {
+  const now = { value: 9_575_000 };
+  const state = setup(now);
+  const telegram: TelegramTransportLike = {
+    async sendMessage() {
+      now.value -= 1_000;
+      return { messageId: 'clock-rollback' };
+    },
+    async editMessage() {}
+  };
+  const delivery = service({ now, setup: state, telegram, price: { value: 100 } });
+  const requestedAtMs = now.value;
+  assert.equal((await delivery.sendRadar({
+    chain: 'bsc', tokenAddress: TOKEN, firstSeenAtMs: now.value - 20_000,
+    marketCapUsd: 80_000, sampledMaxGain: 0.5, stage: 'bonding',
+    presentation: {
+      name: 'Clock Meme', symbol: 'CLK', marketCapUsd: 80_000,
+      rank: 7, currentGain: 0.2, activationReason: 'DUAL_RANK'
+    }
+  })).outcome, 'SENT');
+  const outbox = new OutboxRepository(state.database).find('bsc', TOKEN, 'radar')!;
+  assert.equal(outbox.status, 'SENT');
+  assert.equal(outbox.receiptAtMs, requestedAtMs);
+  assert.equal(outbox.initialPayload?.receiptAtMs, requestedAtMs);
   state.database.close();
 });
 
@@ -407,10 +461,16 @@ test('radar edits one message only for semantic changes and retries a failed edi
     firstSeenAtMs: now.value - 20_000,
     marketCapUsd: 80_000,
     sampledMaxGain: 0.5,
-    stage: 'bonding' as const
+    stage: 'bonding' as const,
+    presentation: {
+      name: 'Test Meme', symbol: 'TME', marketCapUsd: 80_000,
+      rank: 7, currentGain: 0.25, activationReason: 'THREE_RISING_1M' as const
+    }
   };
 
   assert.equal((await delivery.sendRadar(bonding)).outcome, 'SENT');
+  const initialPayload = new OutboxRepository(state.database)
+    .find('bsc', TOKEN, 'radar')!.initialPayload;
   assert.equal((await delivery.sendRadar(bonding)).outcome, 'DUPLICATE');
   assert.equal(telegram.sends.length, 1);
   assert.equal(telegram.edits.length, 0);
@@ -452,6 +512,10 @@ test('radar edits one message only for semantic changes and retries a failed edi
   assert.equal((await delivery.sendRadar(rejected)).outcome, 'RETRYABLE_FAILURE');
   assert.equal((await delivery.sendRadar(rejected)).outcome, 'SENT');
   assert.equal(telegram.edits.length, 7);
+  assert.deepEqual(
+    new OutboxRepository(state.database).find('bsc', TOKEN, 'radar')!.initialPayload,
+    initialPayload
+  );
   state.database.close();
 });
 
@@ -623,6 +687,44 @@ test('suppresses a new outbox only when pre-send drift is strictly above eight p
     );
     state.database.close();
   }
+});
+
+test('pre-send local fixed-pool identity failure rejects and releases the candidate', async () => {
+  const now = { value: 11_250_000 };
+  const state = setup(now);
+  const released: string[] = [];
+  const delivery = service({
+    now,
+    setup: state,
+    telegram: new FakeTelegram(),
+    price: { value: 100 },
+    trades: () => {
+      throw new FixedPoolContractError(
+        'pool_trades',
+        'binding',
+        'LOCAL_POOL_IDENTITY_MISMATCH',
+        'fixture mismatch'
+      );
+    },
+    release: (_chain, token) => released.push(token)
+  });
+  const result = await delivery.sendSignal(state.eligibility, 'validation');
+  assert.deepEqual(result, {
+    outcome: 'SUPPRESSED', reason: 'LOCAL_POOL_IDENTITY_MISMATCH'
+  });
+  assert.equal(
+    state.candidates.find('bsc', TOKEN)!.terminalReason,
+    'LOCAL_POOL_IDENTITY_MISMATCH'
+  );
+  assert.deepEqual(released, [TOKEN]);
+  assert.equal(
+    state.database.prepare(`
+      SELECT count(*) AS count FROM qualification_events
+      WHERE reason_code = 'LOCAL_POOL_IDENTITY_MISMATCH'
+    `).get()!.count,
+    1
+  );
+  state.database.close();
 });
 
 test('does not send an eligibility snapshot after its qualification window closes', async () => {

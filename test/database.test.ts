@@ -24,6 +24,21 @@ const BSC_POOL = '0xAbCdEf0000000000000000000000000000000002';
 const BSC_COUNTER = '0xAbCdEf0000000000000000000000000000000003';
 const SOL_TOKEN = 'So11111111111111111111111111111111111111112';
 
+function radarPayload(stage = 'bonding') {
+  return {
+    text: 'radar fixture',
+    snapshot: {
+      chain: 'bsc', tokenAddress: BSC_TOKEN.toLowerCase(),
+      firstSeenAtMs: 100, marketCapUsd: 30_000, sampledMaxGain: 0.2,
+      stage,
+      presentation: {
+        name: 'Fixture', symbol: 'FIX', marketCapUsd: 30_000,
+        rank: 7, currentGain: 0.1, activationReason: 'DUAL_RANK'
+      }
+    }
+  };
+}
+
 function seedBscCandidate(database = openDatabase(':memory:')) {
   const rules = new RuleVersionRepository(database);
   rules.save('rules-a', { threshold: 1 }, 1);
@@ -39,6 +54,32 @@ function seedBscCandidate(database = openDatabase(':memory:')) {
     discoveryRuleVersion: 'rules-a'
   }).candidate;
   return { database, rules, candidates, candidate };
+}
+
+function openV6Database(path: string): DatabaseSync {
+  const database = new DatabaseSync(path);
+  database.exec(`
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE _migrations (
+      version INTEGER PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      checksum TEXT NOT NULL,
+      applied_at_ms INTEGER NOT NULL
+    ) STRICT;
+  `);
+  const insert = database.prepare(
+    'INSERT INTO _migrations(version, name, checksum, applied_at_ms) VALUES (?, ?, ?, ?)'
+  );
+  for (const migration of MIGRATIONS.filter((item) => item.version <= 6)) {
+    database.exec(migration.sql);
+    insert.run(
+      migration.version,
+      migration.name,
+      createHash('sha256').update(migration.sql).digest('hex'),
+      migration.version
+    );
+  }
+  return database;
 }
 
 test('creates all migrations and enables WAL for file databases', () => {
@@ -300,25 +341,34 @@ test('rejects an applied migration whose stored checksum no longer matches', () 
 test('upgrades legacy migration metadata without changing application data', () => {
   const directory = mkdtempSync(join(tmpdir(), 'meme-signal-legacy-'));
   const path = join(directory, 'state.db');
-  const seeded = seedBscCandidate(openDatabase(path));
-  seeded.database.exec(`
-    DROP TABLE _migrations;
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    PRAGMA foreign_keys = ON;
     CREATE TABLE _migrations (
       version INTEGER PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,
       applied_at_ms INTEGER NOT NULL
     ) STRICT;
-    INSERT INTO _migrations(version, name, applied_at_ms)
-    VALUES
-      (1, 'initial_state', 1),
-      (2, 'successful_rank_fetches', 2),
-      (3, 'compact_rank_fetches', 3),
-      (4, 'signal_delivery_followups', 4),
-      (5, 'signal_evaluation_and_chain_release', 5);
-    INSERT INTO _migrations(version, name, applied_at_ms)
-    VALUES (6, 'optimized_low_cap_signal_rules', 6);
   `);
-  seeded.database.close();
+  const insertMigration = legacy.prepare(
+    'INSERT INTO _migrations(version, name, applied_at_ms) VALUES (?, ?, ?)'
+  );
+  for (const migration of MIGRATIONS.filter((item) => item.version <= 6)) {
+    legacy.exec(migration.sql);
+    insertMigration.run(migration.version, migration.name, migration.version);
+  }
+  new RuleVersionRepository(legacy).save('rules-a', { threshold: 1 }, 1);
+  new CandidateRepository(legacy).findOrCreate({
+    chain: 'bsc',
+    tokenAddress: BSC_TOKEN,
+    firstSeenAtMs: 100,
+    firstSeenPriceUsd: 0.001,
+    firstSeenRank: 7,
+    firstSeenMarketCapUsd: 30_000,
+    firstSeenLiquidityUsd: 12_000,
+    discoveryRuleVersion: 'rules-a'
+  });
+  legacy.close();
 
   const upgraded = openDatabase(path);
   const columns = upgraded
@@ -395,6 +445,116 @@ test('upgrades an applied v2 rank-fetch table without losing state', () => {
   assert.doesNotThrow(() => openDatabase(path).close());
 });
 
+test('v7 upgrades a v6 file atomically and bridges only pre-upgrade BSC bonding radar facts', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'meme-signal-v7-'));
+  const path = join(directory, 'state.db');
+  const v6 = openV6Database(path);
+  new RuleVersionRepository(v6).save('rules-old', { version: 'old' }, 1);
+  const candidates = new CandidateRepository(v6);
+  candidates.findOrCreate({
+    chain: 'bsc', tokenAddress: BSC_TOKEN, firstSeenAtMs: 100,
+    firstSeenPriceUsd: 0.001, firstSeenRank: 3,
+    firstSeenMarketCapUsd: 30_000, firstSeenLiquidityUsd: 0,
+    discoveryRuleVersion: 'rules-old'
+  });
+  candidates.transition('bsc', BSC_TOKEN, 'RADAR', { atMs: 120 });
+  const events = new QualificationEventRepository(v6);
+  events.record({
+    chain: 'bsc', tokenAddress: BSC_TOKEN, stage: 'activation', outcome: 'WAIT',
+    reasonCode: 'THREE_RISING_1M_BONDING_CURVE', source: 'gmgn', observedAtMs: 130,
+    raw: { source: 'earliest' }, normalized: { rank: 3 }, thresholds: { rankMax: 5 },
+    decisionRuleVersion: 'rules-old'
+  });
+  events.record({
+    chain: 'bsc', tokenAddress: BSC_TOKEN, stage: 'activation', outcome: 'WAIT',
+    reasonCode: 'DUAL_RANK_BONDING_CURVE', source: 'gmgn', observedAtMs: 140,
+    raw: { source: 'later' }, normalized: { rank: 3 }, thresholds: { rankMax: 5 },
+    decisionRuleVersion: 'rules-old'
+  });
+  v6.prepare(`
+    INSERT INTO message_outbox(
+      chain, token_address, message_kind, channel_role, status, payload_json,
+      receipt_at_ms, telegram_message_id, created_at_ms, updated_at_ms
+    ) VALUES ('bsc', ?, 'radar', 'radar', 'SENT', '{}', 150, 'old-message', 145, 150)
+  `).run(BSC_TOKEN.toLowerCase());
+  v6.close();
+
+  const upgraded = openDatabase(path);
+  const shortcut = upgraded.prepare(`
+    SELECT source, observed_at_ms, raw_json, normalized_json, thresholds_json,
+           decision_rule_version
+    FROM qualification_events
+    WHERE stage = 'bonding_shortcut_readiness'
+  `).get() as Record<string, unknown>;
+  assert.deepEqual({ ...shortcut }, {
+    source: 'gmgn', observed_at_ms: 130,
+    raw_json: '{"source":"earliest"}', normalized_json: '{"rank":3}',
+    thresholds_json: '{"rankMax":5}', decision_rule_version: 'rules-old'
+  });
+  assert.equal(
+    upgraded.prepare('SELECT initial_payload_json FROM message_outbox').get()!
+      .initial_payload_json,
+    null
+  );
+  assert.equal(upgraded.prepare('SELECT count(*) AS count FROM _migrations WHERE version = 7').get()!.count, 1);
+
+  const top7 = '0x0000000000000000000000000000000000000007';
+  new RuleVersionRepository(upgraded).save('rules-new', { version: 'new' }, 200);
+  const upgradedCandidates = new CandidateRepository(upgraded);
+  upgradedCandidates.findOrCreate({
+    chain: 'bsc', tokenAddress: top7, firstSeenAtMs: 200,
+    firstSeenPriceUsd: 0.001, firstSeenRank: 7,
+    firstSeenMarketCapUsd: 30_000, firstSeenLiquidityUsd: 0,
+    discoveryRuleVersion: 'rules-new'
+  });
+  upgradedCandidates.transition('bsc', top7, 'RADAR', { atMs: 210 });
+  new QualificationEventRepository(upgraded).record({
+    chain: 'bsc', tokenAddress: top7, stage: 'activation', outcome: 'WAIT',
+    reasonCode: 'DUAL_RANK_BONDING_CURVE', source: 'gmgn', observedAtMs: 220,
+    raw: {}, normalized: { rank: 7 }, thresholds: {}, decisionRuleVersion: 'rules-new'
+  });
+  assert.equal(
+    upgraded.prepare(`
+      SELECT count(*) AS count FROM qualification_events
+      WHERE token_address = ? AND stage = 'bonding_shortcut_readiness'
+    `).get(top7)!.count,
+    0
+  );
+  upgraded.close();
+
+  const failedPath = join(directory, 'failed.db');
+  const failedV6 = openV6Database(failedPath);
+  new RuleVersionRepository(failedV6).save('rules-old', {}, 1);
+  const failedCandidates = new CandidateRepository(failedV6);
+  failedCandidates.findOrCreate({
+    chain: 'bsc', tokenAddress: BSC_TOKEN, firstSeenAtMs: 100,
+    firstSeenPriceUsd: 0.001, firstSeenRank: 3,
+    firstSeenMarketCapUsd: 30_000, firstSeenLiquidityUsd: 0,
+    discoveryRuleVersion: 'rules-old'
+  });
+  failedCandidates.transition('bsc', BSC_TOKEN, 'RADAR', { atMs: 120 });
+  new QualificationEventRepository(failedV6).record({
+    chain: 'bsc', tokenAddress: BSC_TOKEN, stage: 'activation', outcome: 'WAIT',
+    reasonCode: 'DUAL_RANK_BONDING_CURVE', source: 'gmgn', observedAtMs: 130,
+    raw: {}, normalized: {}, thresholds: {}, decisionRuleVersion: 'rules-old'
+  });
+  failedV6.exec(`
+    CREATE TRIGGER fail_v7_bridge BEFORE INSERT ON qualification_events
+    WHEN NEW.stage = 'bonding_shortcut_readiness'
+    BEGIN SELECT RAISE(ABORT, 'fixture migration failure'); END;
+  `);
+  failedV6.close();
+  assert.throws(() => openDatabase(failedPath), /fixture migration failure/);
+  const failed = new DatabaseSync(failedPath);
+  assert.equal(
+    failed.prepare('PRAGMA table_info(message_outbox)').all()
+      .some((row) => (row as { name: string }).name === 'initial_payload_json'),
+    false
+  );
+  assert.equal(failed.prepare('SELECT count(*) AS count FROM _migrations WHERE version = 7').get()!.count, 0);
+  failed.close();
+});
+
 test('outbox retries explicit failures but quarantines unknown or interrupted sends', () => {
   const directory = mkdtempSync(join(tmpdir(), 'meme-signal-outbox-'));
   const path = join(directory, 'state.db');
@@ -439,6 +599,43 @@ test('outbox retries explicit failures but quarantines unknown or interrupted se
   const second = openDatabase(path);
   assert.equal(new OutboxRepository(second).recoverInterruptedSends(300), 0);
   second.close();
+});
+
+test('radar SENT transition atomically stores one immutable initial envelope', () => {
+  const { database } = seedBscCandidate();
+  const outbox = new OutboxRepository(database);
+  const row = outbox.create({
+    chain: 'bsc', tokenAddress: BSC_TOKEN, messageKind: 'radar',
+    channelRole: 'radar', payload: radarPayload(), createdAtMs: 200
+  });
+  outbox.claim(row.id, 210);
+  assert.throws(() => outbox.markSent(row.id, 'radar-bypass', 220), /signal outbox/);
+  const sent = outbox.markRadarSent(row.id, 'radar-42', 220, 'rules-a', 'hash-a');
+  assert.equal(sent.status, 'SENT');
+  assert.deepEqual(sent.initialPayload, {
+    payload: radarPayload(),
+    sendRequestedAtMs: 210,
+    receiptAtMs: 220,
+    ruleVersion: 'rules-a'
+  });
+  const editedPayload = { ...radarPayload('real_pool'), text: 'edited radar fixture' };
+  outbox.updateRadarPayload(row.id, editedPayload, 230);
+  outbox.markPayloadApplied(row.id, 'hash-b', 240);
+  const edited = outbox.find('bsc', BSC_TOKEN, 'radar')!;
+  assert.deepEqual(edited.payload, editedPayload);
+  assert.deepEqual(edited.initialPayload, sent.initialPayload);
+  assert.throws(
+    () => outbox.markRadarSent(row.id, 'radar-43', 250, 'rules-a', 'hash-c'),
+    /not sending/
+  );
+  database.prepare(`
+    UPDATE message_outbox SET initial_payload_json = '{"payload":{}}' WHERE id = ?
+  `).run(row.id);
+  assert.throws(
+    () => outbox.find('bsc', BSC_TOKEN, 'radar'),
+    /initial payload text is required/
+  );
+  database.close();
 });
 
 test('restart converts a crash-after-send window to non-retryable UNCERTAIN', () => {

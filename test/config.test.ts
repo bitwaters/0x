@@ -31,6 +31,18 @@ test('parses safe defaults without exposing provider secrets', () => {
   assert.equal(config.thresholds.marketCapMinUsd, 10_000);
   assert.equal(config.thresholds.marketCapMaxUsd, 300_000);
   assert.deepEqual(config.qualificationPolicy.marketCapUsd, { min: 20_000, max: 300_000 });
+  assert.deepEqual(config.discoveryPolicy.publicRadar, {
+    sol: {
+      bondingRank: { min: 1, max: 5 },
+      realPoolRank: { min: 1, max: 20 },
+      revivalPublic: true
+    },
+    bsc: {
+      bondingRank: { min: 6, max: 10 },
+      realPoolRank: { min: 6, max: 10 },
+      revivalPublic: false
+    }
+  });
   assert.equal(config.limits.coinGeckoRestRpm, 450);
   assert.equal(config.qualificationPolicy.tradeMinCount, 5);
   assert.deepEqual(config.sourcePolicy.gmgnTrendingFilters.bsc, [
