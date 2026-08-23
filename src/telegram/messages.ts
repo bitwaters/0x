@@ -5,6 +5,7 @@ import type {
   SendEligibilitySnapshot,
   TokenPresentationSnapshot
 } from '../qualification/snapshot.js';
+import { QUALIFICATION_POLICY } from '../qualification/policy.js';
 import { gmgnTokenPageUrl } from '../providers/sourcePolicy.js';
 import type { TelegramMessageOptions } from './transport.js';
 
@@ -16,6 +17,8 @@ export interface RadarMessageSnapshot {
   readonly firstSeenAtMs: number;
   readonly marketCapUsd: number;
   readonly sampledMaxGain: number;
+  readonly pushedAtGain?: number;
+  readonly postPushMaxGain?: number;
   readonly stage:
     | 'bonding'
     | 'real_pool'
@@ -250,6 +253,12 @@ export function renderRadarMessage(snapshot: RadarMessageSnapshot): string {
       : snapshot.stage === 'expired' || snapshot.stage === 'rejected'
         ? '⚠️ 本次雷达观察已结束，不构成买入建议。'
         : '⚠️ 仅为雷达观察，尚未通过真实固定池正式资格。';
+  const gainLines = snapshot.pushedAtGain === undefined
+    ? [`📈 发现后最高 ${signedPercent(snapshot.sampledMaxGain)}`]
+    : [
+        `📈 推送时已涨 ${signedPercent(snapshot.pushedAtGain)} · 推送后最高 ${signedPercent(snapshot.postPushMaxGain ?? 0)}`,
+        ...(snapshot.pushedAtGain >= 0.8 ? ['⚠️ 推送时已高涨，追高风险较高'] : [])
+      ];
   return ensureTelegramLength([
     `🔎 ${CHAIN_DISPLAY[snapshot.chain].title} · Meme 雷达`,
     stage,
@@ -260,7 +269,7 @@ export function renderRadarMessage(snapshot: RadarMessageSnapshot): string {
     '',
     `💰 市值 ${money(marketCap)} · 1m 排名 ${display === undefined ? '—' : `#${display.rank}`}`,
     `🔥 激活 ${activation(display?.activationReason)}`,
-    `📈 发现后最高 ${signedPercent(snapshot.sampledMaxGain)}`,
+    ...gainLines,
     `🕐 首次发现 ${new Date(snapshot.firstSeenAtMs).toISOString()} (UTC)`,
     '',
     footer
@@ -300,7 +309,7 @@ export function renderSignalMessage(
     `🔥 ${activation(display?.activationReason)} · 当前 1m ${display === undefined ? '—' : `#${display.rank}`}`,
     `📈 当前 ${signedPercent(display?.currentGain)} · 发现后最高 ${signedPercent(value.sampledMaxGain)}`,
     '',
-    '<b>⚡ 30 秒成交</b>',
+    `<b>⚡ ${QUALIFICATION_POLICY.tradeWindowMs / 1_000} 秒成交</b>`,
     `${value.trades.trades.length} 笔 · 成交额 ${money(value.trades.totalUsd)} · 买入笔数 ${percent(value.trades.buyCountRatio)}`,
     `买入金额 ${percent(value.trades.buyUsdRatio)} · 净买入 ${money(value.trades.netBuyUsd)}`,
     `💧 $100 深度占比 ${percent(value.liquidity.depthRatio)}`,

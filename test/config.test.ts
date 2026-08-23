@@ -48,7 +48,8 @@ test('parses safe defaults without exposing provider secrets', () => {
     }
   });
   assert.equal(config.limits.coinGeckoRestRpm, 450);
-  assert.equal(config.qualificationPolicy.tradeMinCount, 5);
+  assert.equal(config.qualificationPolicy.tradeMinCount, 3);
+  assert.equal(config.thresholds.qualificationWindowSeconds, 180);
   assert.deepEqual(config.sourcePolicy.gmgnTrendingFilters.bsc, [
     'not_honeypot',
     'verified',
@@ -78,6 +79,23 @@ test('changes rule version for rule changes but not secret rotation', () => {
   assert.equal(initial.ruleVersion, rotatedSecret.ruleVersion);
   assert.equal(initial.ruleVersion, movedRuntime.ruleVersion);
   assert.notEqual(initial.ruleVersion, changedRule.ruleVersion);
+});
+
+test('accepts the legacy qualification window but keeps the policy at 180 seconds', () => {
+  const config = parseConfig({
+    ...BASE_ENV,
+    QUALIFICATION_WINDOW_SECONDS: '120'
+  });
+
+  assert.equal(config.thresholds.qualificationWindowSeconds, 180);
+  assert.throws(
+    () => parseConfig({ ...BASE_ENV, QUALIFICATION_WINDOW_SECONDS: 'invalid' }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConfigError);
+      assert.match(error.message, /QUALIFICATION_WINDOW_SECONDS/);
+      return true;
+    }
+  );
 });
 
 test('loads a mode-600 env file into an injected environment object', () => {

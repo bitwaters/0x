@@ -84,7 +84,6 @@ const environmentSchema = z
     GMGN_POLL_1M_MS: integerInRange(3_000, 1_000, 5_000),
     GMGN_POLL_5M_MS: integerInRange(10_000, 6_000, 12_000),
     LIQUIDITY_MIN_USD: positiveNumber(10_000),
-    QUALIFICATION_WINDOW_SECONDS: integerInRange(120, 30, 600),
     MAX_OBSERVED_GAIN_RATIO: ratio(0.8),
     TOP10_MAX_RATIO: ratio(0.25),
     INSIDER_MAX_RATIO: ratio(0.2),
@@ -92,6 +91,7 @@ const environmentSchema = z
     DEV_TEAM_MAX_RATIO: ratio(0.2),
     RUG_MAX_RATIO: ratio(0.3),
     TAX_MAX_RATIO: ratio(0.05),
+    QUALIFICATION_WINDOW_SECONDS: integerInRange(120, 30, 600),
     GMGN_REST_RPM: finiteNumber(120).pipe(z.number().int().min(1).max(120)),
     COINGECKO_REST_RPM: finiteNumber(450).pipe(z.number().int().min(1).max(450))
   })
@@ -269,7 +269,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv): RuntimeConfig {
       marketCapMinUsd: DISCOVERY_POLICY.internalMarketCapUsd.min,
       marketCapMaxUsd: DISCOVERY_POLICY.internalMarketCapUsd.max,
       liquidityMinUsd: value.LIQUIDITY_MIN_USD,
-      qualificationWindowSeconds: value.QUALIFICATION_WINDOW_SECONDS,
+      qualificationWindowSeconds: QUALIFICATION_POLICY.qualificationWindowSeconds,
       maxObservedGainRatio: value.MAX_OBSERVED_GAIN_RATIO,
       top10MaxRatio: value.TOP10_MAX_RATIO,
       insiderMaxRatio: value.INSIDER_MAX_RATIO,

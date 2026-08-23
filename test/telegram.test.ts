@@ -450,6 +450,21 @@ test('radar receipt remains SENT when the wall clock moves backward during Teleg
   state.database.close();
 });
 
+test('radar separates push-time and post-push gains and marks high-chase risk', () => {
+  const card = renderRadarCard({
+    chain: 'bsc', tokenAddress: TOKEN, firstSeenAtMs: 9_000_000,
+    marketCapUsd: 80_000, sampledMaxGain: 3,
+    pushedAtGain: 0.8, postPushMaxGain: 1.25, stage: 'bonding',
+    presentation: {
+      name: 'Gain Meme', symbol: 'GAIN', marketCapUsd: 90_000,
+      rank: 7, currentGain: 1.1, activationReason: 'DUAL_RANK'
+    }
+  });
+  assert.match(card.text, /推送时已涨 \+80\.0% · 推送后最高 \+125\.0%/);
+  assert.match(card.text, /推送时已高涨，追高风险较高/);
+  assert.doesNotMatch(card.text, /发现后最高 \+300\.0%/);
+});
+
 test('radar edits one message only for semantic changes and retries a failed edit finitely', async () => {
   const now = { value: 9_600_000 };
   const state = setup(now);
@@ -535,6 +550,7 @@ test('renders fused SOL/BSC cards safely with front-loaded CA and one preserved 
   assert.match(bsc.text, /Test Meme \(\$TME\)/);
   assert.match(bsc.text, /1m \+ 5m 双榜/);
   assert.match(bsc.text, /固定池流动性/);
+  assert.match(bsc.text, /60 秒成交/);
   assert.match(bsc.text, /Top10/);
   assert.doesNotMatch(bsc.text, /candidateSide|规则版本|rules-|GMGN \+ CoinGecko|\{"/);
   assert.deepEqual(bsc.options, telegramCardOptions('bsc', TOKEN));

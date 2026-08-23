@@ -476,7 +476,7 @@ test('sampled high-water starts at real-pool activation and ignores bonding-era 
   database.close();
 });
 
-test('qualification window expires atomically at 120 seconds and remains terminal', () => {
+test('qualification window expires atomically at 180 seconds and remains terminal', () => {
   const now = { value: 1_000 };
   const token = address(30);
   const { database, engine, candidates } = setup(now, (candidate) =>
@@ -501,8 +501,8 @@ test('qualification window expires atomically at 120 seconds and remains termina
     counterTokenAddress: address(902),
     boundAtMs: 1_000
   });
-  assert.equal(engine.expireQualificationWindows(120_999).length, 0);
-  assert.equal(engine.expireQualificationWindows(121_000).length, 1);
+  assert.equal(engine.expireQualificationWindows(180_999).length, 0);
+  assert.equal(engine.expireQualificationWindows(181_000).length, 1);
   assert.equal(candidates.find('bsc', token)!.status, 'EXPIRED');
   assert.throws(() => candidates.transition('bsc', token, 'MONITORING'), /invalid/);
   assert.equal(
@@ -515,7 +515,7 @@ test('qualification window expires atomically at 120 seconds and remains termina
 });
 
 test('poller startup expires overdue qualifications even when GMGN is unavailable', () => {
-  const now = { value: 121_000 };
+  const now = { value: 181_000 };
   const token = address(31);
   const { database, config, engine, candidates } = setup(now, (candidate) =>
     tokenInfo({ token: candidate, fetchedAtMs: now.value })

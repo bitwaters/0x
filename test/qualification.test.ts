@@ -76,42 +76,37 @@ function detail(
   });
 }
 
-test('30-second trades use provider IDs once and pass exact momentum boundaries', () => {
+test('60-second trades use provider IDs once and pass exact momentum boundaries', () => {
   const now = 1_000_000;
   const trades = [
-    trade('a', 'buy', 40, now),
-    trade('b', 'buy', 20, now - 1_000),
-    trade('c', 'buy', 20, now - 2_000),
-    trade('d', 'sell', 10, now - 3_000),
-    trade('e', 'sell', 10, now - 4_000),
-    trade('a', 'buy', 40, now)
+    trade('a', 'buy', 20, now),
+    trade('b', 'buy', 10, now - 30_000),
+    trade('c', 'sell', 10, now - 59_000),
+    trade('a', 'buy', 20, now)
   ];
   const decision = evaluateTradeWindow(trades, now);
   assert.equal(decision.passed, true);
-  assert.equal(decision.trades.length, 5);
-  assert.equal(decision.buyCountRatio, 0.6);
-  assert.equal(decision.totalUsd, 500);
-  assert.equal(decision.buyUsdRatio, 0.8);
-  assert.equal(decision.netBuyUsd, 300);
-  assert.equal(decision.largestTradeRatio, 0.4);
+  assert.equal(decision.trades.length, 3);
+  assert.equal(decision.buyCountRatio, 2 / 3);
+  assert.equal(decision.totalUsd, 200);
+  assert.equal(decision.buyUsdRatio, 0.75);
+  assert.equal(decision.netBuyUsd, 100);
+  assert.equal(decision.largestTradeRatio, 0.5);
 });
 
 test('trade window waits on low count, stale latest, weak net buys or a dominant trade', () => {
   const now = 2_000_000;
   const decision = evaluateTradeWindow(
     [
-      trade('a', 'buy', 70, now - 16_000),
-      trade('b', 'buy', 5, now - 17_000),
-      trade('c', 'sell', 10, now - 18_000),
-      trade('d', 'sell', 10, now - 19_000)
+      trade('a', 'buy', 15, now - 16_000),
+      trade('b', 'sell', 25, now - 17_000)
     ],
     now
   );
   assert.deepEqual(decision.reasons, [
     'TRADE_COUNT_LOW',
-    'TRADE_VOLUME_LOW',
     'LATEST_TRADE_STALE',
-    'BUY_COUNT_RATIO_LOW',
+    'BUY_USD_RATIO_LOW',
     'LARGEST_TRADE_TOO_HIGH'
   ]);
 });
@@ -122,7 +117,6 @@ test('trade window treats missing facts as waiting and conflicting provider IDs 
     'TRADE_COUNT_LOW',
     'TRADE_VOLUME_LOW',
     'LATEST_TRADE_STALE',
-    'BUY_COUNT_RATIO_LOW',
     'BUY_USD_RATIO_LOW',
     'LARGEST_TRADE_TOO_HIGH'
   ]);
@@ -420,7 +414,7 @@ test('qualification binds once, waits ten seconds, then becomes eligible', async
     'trades'
   ]);
   assert.ok(JSON.parse(evidence.normalized_json).security);
-  assert.equal(JSON.parse(evidence.thresholds_json).qualification.tradeMinCount, 5);
+  assert.equal(JSON.parse(evidence.thresholds_json).qualification.tradeMinCount, 3);
   database.close();
 });
 

@@ -26,6 +26,7 @@ import type {
   QualificationGmgnSource
 } from '../qualification/service.js';
 import { FixedPoolQualificationService } from '../qualification/service.js';
+import { QUALIFICATION_POLICY } from '../qualification/policy.js';
 import { activationReasonFromCode } from '../qualification/snapshot.js';
 import { formatSafeError } from '../security/redaction.js';
 import {
@@ -50,6 +51,7 @@ const FOLLOWUP_TICK_MS = 1_000;
 const EVALUATION_TICK_MS = 1_000;
 const PROGRESS_TICK_MS = 60_000;
 const RADAR_DELIVERY_MIN_INTERVAL_MS = 1_200;
+const BOUND_QUALIFICATION_BURST = 3;
 
 type RuntimeGmgnSource = TrendingSource & QualificationGmgnSource & DeliveryGmgnSource & EvaluationGmgnSource;
 type RuntimeCoinGeckoSource = QualificationCoinGeckoSource & DeliveryCoinGeckoSource & EvaluationCoinGeckoSource;
@@ -88,8 +90,16 @@ export class BotRuntime {
   private readonly sockets: G2SocketManager;
   private readonly abortController = new AbortController();
   private readonly qualificationLastAt = new Map<string, number>();
+  private readonly qualificationWaits = new Map<string, {
+    chain: Chain;
+    status: CandidateRecord['status'];
+    reason: string;
+    occurrences: number;
+    tokens: Set<string>;
+  }>();
   private readonly radarLastAt = new Map<string, number>();
   private radarNextDeliveryAtMs = 0;
+  private consecutiveBoundQualifications = 0;
   private readonly signalPreviewed = new Set<string>();
   private readonly dirtyPools = new Map<string, { chain: Chain; poolAddress: string }>();
   private readonly timers: Array<ReturnType<typeof setInterval>> = [];
@@ -334,6 +344,22 @@ export class BotRuntime {
         typeof (initialSnapshot as { readonly stage?: unknown }).stage === 'string'
           ? (initialSnapshot as { readonly stage: string }).stage
           : undefined;
+      const initialPresentation =
+        initialSnapshot !== null &&
+        typeof initialSnapshot === 'object' &&
+        !Array.isArray(initialSnapshot) &&
+        (initialSnapshot as { readonly presentation?: unknown }).presentation !== null &&
+        typeof (initialSnapshot as { readonly presentation?: unknown }).presentation === 'object' &&
+        !Array.isArray((initialSnapshot as { readonly presentation?: unknown }).presentation)
+          ? (initialSnapshot as {
+              readonly presentation: { readonly currentGain?: unknown };
+            }).presentation
+          : undefined;
+      const initialPushGain =
+        typeof initialPresentation?.currentGain === 'number' &&
+        Number.isFinite(initialPresentation.currentGain)
+          ? initialPresentation.currentGain
+          : undefined;
       const sentBonding = existing?.status === 'SENT' && initialStage === 'bonding';
       const bondingPublic =
         candidate.status === 'RADAR' &&
@@ -463,6 +489,8 @@ export class BotRuntime {
         candidate,
         latestFresh ? latest : undefined,
         existing?.payload,
+        initialPushGain,
+        existing?.status === 'SENT',
         stage,
         waitReason
       );
@@ -487,6 +515,8 @@ export class BotRuntime {
     candidate: CandidateRecord,
     latestRank: ReturnType<RankSnapshotRepository['findLatest']>,
     existingPayload: unknown,
+    initialPushGain: number | undefined,
+    existingSent: boolean,
     stage: RadarMessageSnapshot['stage'],
     waitReason?: RadarMessageSnapshot['waitReason']
   ): Promise<DeliveryResult | undefined> {
@@ -506,12 +536,26 @@ export class BotRuntime {
       existingPayload !== null && typeof existingPayload === 'object' && !Array.isArray(existingPayload)
         ? (existingPayload as { readonly snapshot?: RadarMessageSnapshot }).snapshot
         : undefined;
+    const currentGain = latestRank === undefined
+      ? undefined
+      : latestRank.priceUsd / candidate.firstSeenPriceUsd - 1;
+    const pushedAtGain =
+      previous?.pushedAtGain ?? initialPushGain ?? (existingSent ? undefined : currentGain);
+    const observedPostPushGain =
+      pushedAtGain === undefined || currentGain === undefined || pushedAtGain <= -1
+        ? undefined
+        : (1 + currentGain) / (1 + pushedAtGain) - 1;
+    const postPushMaxGain = pushedAtGain === undefined
+      ? undefined
+      : Math.max(0, previous?.postPushMaxGain ?? 0, observedPostPushGain ?? 0);
     const snapshot: RadarMessageSnapshot = {
       chain: candidate.chain,
       tokenAddress: candidate.tokenAddress,
       firstSeenAtMs: candidate.firstSeenAtMs,
       marketCapUsd: candidate.firstSeenMarketCapUsd,
       sampledMaxGain: candidate.sampledMaxGain,
+      ...(pushedAtGain === undefined ? {} : { pushedAtGain }),
+      ...(postPushMaxGain === undefined ? {} : { postPushMaxGain }),
       stage,
       ...(waitReason === undefined ? {} : { waitReason }),
       ...(latestRank !== undefined &&
@@ -524,7 +568,7 @@ export class BotRuntime {
               symbol,
               marketCapUsd: latestRank.marketCapUsd,
               rank: latestRank.rank,
-              currentGain: latestRank.priceUsd / candidate.firstSeenPriceUsd - 1,
+              currentGain: currentGain!,
               activationReason
             }
           }
@@ -553,20 +597,32 @@ export class BotRuntime {
 
   private async processQualification(actionable: readonly CandidateRecord[]): Promise<void> {
     const nowMs = this.now();
-    const candidate = actionable
+    const eligible = actionable
       .filter((item) => {
         if (!['PREHEAT', 'POOL_BOUND', 'MONITORING'].includes(item.status)) return false;
         if (this.evaluation.signalRole(item.chain) === undefined) return false;
+        if (item.status === 'PREHEAT' && !this.isCurrentPreheatCandidate(item, nowMs)) {
+          return false;
+        }
         const last = this.qualificationLastAt.get(`${item.chain}:${item.tokenAddress}`);
         return last === undefined || nowMs - last >= QUALIFICATION_REFRESH_MS;
-      })
-      .sort((left, right) => {
+      });
+    const oldestFirst = (left: CandidateRecord, right: CandidateRecord) => {
         const leftAt = this.qualificationLastAt.get(`${left.chain}:${left.tokenAddress}`);
         const rightAt = this.qualificationLastAt.get(`${right.chain}:${right.tokenAddress}`);
         return (leftAt ?? Number.NEGATIVE_INFINITY) - (rightAt ?? Number.NEGATIVE_INFINITY);
-      })[0];
+      };
+    const bound = eligible.filter((item) => item.status !== 'PREHEAT').sort(oldestFirst);
+    const preheat = eligible.filter((item) => item.status === 'PREHEAT').sort(oldestFirst);
+    const candidate =
+      preheat.length > 0 && this.consecutiveBoundQualifications >= BOUND_QUALIFICATION_BURST
+        ? preheat[0]
+        : bound[0] ?? preheat[0];
     if (candidate === undefined) return;
     if (!this.config.chains[candidate.chain]) return;
+    this.consecutiveBoundQualifications = candidate.status === 'PREHEAT'
+      ? 0
+      : this.consecutiveBoundQualifications + 1;
     const key = `${candidate.chain}:${candidate.tokenAddress}`;
     this.qualificationLastAt.set(key, nowMs);
     const result = await this.qualification.refresh(
@@ -574,6 +630,9 @@ export class BotRuntime {
       candidate.tokenAddress,
       this.abortController.signal
     );
+    if (result.outcome === 'WAIT') {
+      this.recordQualificationWait(candidate, result.reasons[0] ?? 'UNKNOWN_WAIT');
+    }
     if (result.outcome !== 'ELIGIBLE' || result.eligibility === undefined) {
       if (result.outcome === 'REJECTED' || result.outcome === 'EXPIRED') {
         this.qualificationLastAt.delete(key);
@@ -611,7 +670,48 @@ export class BotRuntime {
     });
   }
 
+  private isCurrentPreheatCandidate(candidate: CandidateRecord, nowMs: number): boolean {
+    const latest = this.rankSnapshots.findLatest(candidate.chain, candidate.tokenAddress, '1m');
+    const currentFetchAt = this.rankSnapshots.findLatestSuccessfulFetchAt(candidate.chain, '1m');
+    return (
+      latest !== undefined &&
+      currentFetchAt !== undefined &&
+      latest.fetchedAtMs === currentFetchAt &&
+      nowMs >= latest.fetchedAtMs &&
+      nowMs - latest.fetchedAtMs <= QUALIFICATION_POLICY.trendingMaxAgeMs &&
+      latest.rank <= QUALIFICATION_POLICY.trendingRankMax &&
+      latest.marketCapUsd >= QUALIFICATION_POLICY.marketCapUsd.min &&
+      latest.marketCapUsd <= QUALIFICATION_POLICY.marketCapUsd.max
+    );
+  }
+
+  private recordQualificationWait(candidate: CandidateRecord, reason: string): void {
+    const current = this.candidates.find(candidate.chain, candidate.tokenAddress) ?? candidate;
+    const key = `${current.chain}:${current.status}:${reason}`;
+    const existing = this.qualificationWaits.get(key) ?? {
+      chain: current.chain,
+      status: current.status,
+      reason,
+      occurrences: 0,
+      tokens: new Set<string>()
+    };
+    existing.occurrences += 1;
+    existing.tokens.add(current.tokenAddress);
+    this.qualificationWaits.set(key, existing);
+  }
+
   private emitProgress(): void {
+    for (const entry of this.qualificationWaits.values()) {
+      this.emit({
+        event: 'qualification_wait',
+        chain: entry.chain,
+        status: entry.status,
+        reason: entry.reason,
+        occurrences: entry.occurrences,
+        uniqueCandidates: entry.tokens.size
+      });
+    }
+    this.qualificationWaits.clear();
     for (const entry of this.progress()) this.emit(entry);
   }
 

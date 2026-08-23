@@ -436,6 +436,113 @@ test('runtime edits one radar through current-rank omission and lifecycle change
   database.close();
 });
 
+test('qualification prioritizes bound pools, locally skips stale PREHEAT, and aggregates WAIT reasons', async () => {
+  const now = { value: 30_000_000 };
+  const staleToken = '0xabcdef0000000000000000000000000000000011';
+  const currentToken = '0xabcdef0000000000000000000000000000000012';
+  const boundTokens = [
+    '0xabcdef0000000000000000000000000000000013',
+    '0xabcdef0000000000000000000000000000000014',
+    '0xabcdef0000000000000000000000000000000015',
+    '0xabcdef0000000000000000000000000000000016'
+  ];
+  const database = openDatabase(':memory:');
+  const config = parseConfig({
+    NODE_ENV: 'test', GMGN_API_KEY: 'gmgn-test', COINGECKO_PRO_API_KEY: 'cg-test'
+  });
+  new RuleVersionRepository(database).save(config.ruleVersion, {
+    thresholds: config.thresholds,
+    discoveryPolicy: config.discoveryPolicy,
+    sourcePolicy: config.sourcePolicy
+  });
+  const candidates = new CandidateRepository(database);
+  for (const tokenAddress of [staleToken, currentToken, ...boundTokens]) {
+    candidates.findOrCreate({
+      chain: 'bsc', tokenAddress, firstSeenAtMs: now.value - 20_000,
+      firstSeenPriceUsd: 0.001, firstSeenRank: 10,
+      firstSeenMarketCapUsd: 80_000, firstSeenLiquidityUsd: 12_000,
+      discoveryRuleVersion: config.ruleVersion
+    });
+    candidates.activate({
+      chain: 'bsc', tokenAddress, opportunityType: 'new_pool',
+      priceUsd: 0.001, ruleVersion: config.ruleVersion, atMs: now.value
+    });
+    candidates.transition('bsc', tokenAddress, 'PREHEAT', { atMs: now.value });
+  }
+  const bindings = new PoolBindingRepository(database);
+  boundTokens.forEach((tokenAddress, index) => {
+    bindings.bind({
+      chain: 'bsc', tokenAddress,
+      poolAddress: `0xabcdef000000000000000000000000000000003${index}`,
+      candidateSide: 'base',
+      counterTokenAddress: `0xabcdef000000000000000000000000000000004${index}`,
+      boundAtMs: now.value
+    });
+  });
+  const snapshots = new RankSnapshotRepository(database);
+  snapshots.insert({
+    chain: 'bsc', interval: '1m', fetchedAtMs: now.value,
+    tokenAddress: currentToken, rank: 10, priceUsd: 0.001,
+    marketCapUsd: 80_000, liquidityUsd: 12_000, raw: {}
+  });
+  new RankSnapshotFetchRepository(database).insert({
+    chain: 'bsc', interval: '1m', fetchedAtMs: now.value,
+    itemCount: 1, discoveryRuleVersion: config.ruleVersion
+  });
+
+  const calls: string[] = [];
+  const gmgn = {
+    async getTrending(chain: 'bsc', interval: '1m') {
+      calls.push('trending');
+      return { chain, interval, fetchedAtMs: now.value, items: [] };
+    },
+    async getTokenInfo(_chain: 'bsc', tokenAddress: string) {
+      calls.push(`info:${tokenAddress}`);
+      return { chain: 'bsc', tokenAddress, fetchedAtMs: now.value };
+    },
+    async getTokenSecurity(_chain: 'bsc', tokenAddress: string) {
+      calls.push(`security:${tokenAddress}`);
+      return { chain: 'bsc', tokenAddress, fetchedAtMs: now.value };
+    }
+  };
+  const logs: Array<Readonly<Record<string, unknown>>> = [];
+  const runtime = new BotRuntime(database, config, {
+    gmgn: gmgn as never,
+    coinGecko: {} as never,
+    now: () => now.value,
+    log: (entry) => logs.push(entry)
+  });
+  const processQualification = async () => {
+    await (runtime as unknown as {
+      processQualification(items: ReturnType<CandidateRepository['listActionable']>): Promise<void>;
+    }).processQualification(candidates.listActionable());
+  };
+
+  await processQualification();
+  await processQualification();
+  await processQualification();
+  await processQualification();
+  const infoCalls = calls.filter((entry) => entry.startsWith('info:'));
+  assert.equal(infoCalls.slice(0, 3).every((entry) =>
+    boundTokens.some((tokenAddress) => entry === `info:${tokenAddress}`)
+  ), true);
+  assert.equal(infoCalls[3], `info:${currentToken}`);
+  assert.equal(infoCalls.includes(`info:${staleToken}`), false);
+
+  (runtime as unknown as { emitProgress(): void }).emitProgress();
+  const waitLogs = logs.filter((entry) => entry.event === 'qualification_wait');
+  assert.deepEqual(waitLogs.map((entry) => ({
+    status: entry.status,
+    reason: entry.reason,
+    occurrences: entry.occurrences,
+    uniqueCandidates: entry.uniqueCandidates
+  })), [
+    { status: 'POOL_BOUND', reason: 'NOT_ON_LATEST_RANK', occurrences: 3, uniqueCandidates: 3 },
+    { status: 'PREHEAT', reason: 'NOT_ON_LATEST_RANK', occurrences: 1, uniqueCandidates: 1 }
+  ]);
+  database.close();
+});
+
 test('SOL sends only verified bonding first and upgrades only its immutable bonding card', async () => {
   const now = { value: 20_000_000 };
   const bondingToken = 'So11111111111111111111111111111111111111112';
@@ -616,6 +723,8 @@ test('SOL sends only verified bonding first and upgrades only its immutable bond
   await processRadar();
   assert.equal(edits.length, 2);
   assert.match(edits[1]!, /已停止观察/);
+  assert.match(edits[1]!, /发现后最高/);
+  assert.doesNotMatch(edits[1]!, /推送时已涨/);
   assert.equal(
     new OutboxRepository(database).find('sol', legacyToken, 'radar')!.initialPayload,
     null

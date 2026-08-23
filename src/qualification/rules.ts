@@ -57,9 +57,6 @@ export function evaluateTradeWindow(
   ) {
     reasons.push('LATEST_TRADE_STALE');
   }
-  if (buyCountRatio < QUALIFICATION_POLICY.buyCountMinRatio) {
-    reasons.push('BUY_COUNT_RATIO_LOW');
-  }
   if (buyUsdRatio < QUALIFICATION_POLICY.buyUsdMinRatio) {
     reasons.push('BUY_USD_RATIO_LOW');
   }
