@@ -1166,6 +1166,14 @@ export class OutboxRepository {
     return result.changes === 1;
   }
 
+  resetRadarRateLimitAttempts(id: number, atMs = Date.now()): void {
+    this.database.prepare(`
+      UPDATE message_outbox SET attempt_count = 0, updated_at_ms = ?
+      WHERE id = ? AND message_kind = 'radar' AND status = 'SENT'
+        AND last_error LIKE 'Telegram rejected request (429):%'
+    `).run(atMs, id);
+  }
+
   markRadarEditFailed(id: number, safeError: string, atMs = Date.now()): OutboxRecord {
     const result = this.database.prepare(`
       UPDATE message_outbox SET last_error = ?, updated_at_ms = ?

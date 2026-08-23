@@ -433,6 +433,14 @@ test('radar edits one message only for semantic changes and retries a failed edi
   }
   assert.equal((await delivery.sendRadar(waiting)).outcome, 'RETRYABLE_FAILURE');
   assert.equal(telegram.edits.length, 5);
+
+  const rejected = { ...bonding, stage: 'rejected' as const };
+  telegram.editErrors.push(
+    new TelegramExplicitError(429, 429, 'Too Many Requests: retry after 10')
+  );
+  assert.equal((await delivery.sendRadar(rejected)).outcome, 'RETRYABLE_FAILURE');
+  assert.equal((await delivery.sendRadar(rejected)).outcome, 'SENT');
+  assert.equal(telegram.edits.length, 7);
   state.database.close();
 });
 

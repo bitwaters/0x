@@ -157,6 +157,9 @@ export class TelegramDeliveryService {
         }
         if (appliedHash === desiredHash) return { outcome: 'DUPLICATE' };
         this.outbox.updateRadarPayload(existing.id, payload, requestedAtMs);
+        if (existing.lastError?.startsWith('Telegram rejected request (429):')) {
+          this.outbox.resetRadarRateLimitAttempts(existing.id, requestedAtMs);
+        }
         if (!this.outbox.claimRadarEdit(existing.id, requestedAtMs)) {
           return { outcome: 'RETRYABLE_FAILURE', reason: 'radar edit retry limit reached' };
         }

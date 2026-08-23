@@ -34,6 +34,7 @@ import {
   type RadarMessageSnapshot
 } from '../telegram/messages.js';
 import type {
+  DeliveryResult,
   DeliveryCoinGeckoSource,
   DeliveryGmgnSource
 } from '../telegram/service.js';
@@ -48,6 +49,7 @@ const QUALIFICATION_REFRESH_MS = 3_000;
 const FOLLOWUP_TICK_MS = 1_000;
 const EVALUATION_TICK_MS = 1_000;
 const PROGRESS_TICK_MS = 60_000;
+const RADAR_DELIVERY_MIN_INTERVAL_MS = 1_200;
 
 type RuntimeGmgnSource = TrendingSource & QualificationGmgnSource & DeliveryGmgnSource & EvaluationGmgnSource;
 type RuntimeCoinGeckoSource = QualificationCoinGeckoSource & DeliveryCoinGeckoSource & EvaluationCoinGeckoSource;
@@ -87,6 +89,7 @@ export class BotRuntime {
   private readonly abortController = new AbortController();
   private readonly qualificationLastAt = new Map<string, number>();
   private readonly radarLastAt = new Map<string, number>();
+  private radarNextDeliveryAtMs = 0;
   private readonly signalPreviewed = new Set<string>();
   private readonly dirtyPools = new Map<string, { chain: Chain; poolAddress: string }>();
   private readonly timers: Array<ReturnType<typeof setInterval>> = [];
@@ -294,7 +297,21 @@ export class BotRuntime {
 
   private async processRadar(actionable: readonly CandidateRecord[]): Promise<void> {
     const nowMs = this.now();
-    for (const candidate of actionable) {
+    if (this.config.telegram.enabled && nowMs < this.radarNextDeliveryAtMs) return;
+    const ordered = [...actionable].sort((left, right) => {
+      const leftAt = this.radarLastAt.get(`${left.chain}:${left.tokenAddress}`);
+      const rightAt = this.radarLastAt.get(`${right.chain}:${right.tokenAddress}`);
+      const checkedOrder =
+        leftAt === undefined
+          ? rightAt === undefined ? 0 : -1
+          : rightAt === undefined ? 1 : leftAt - rightAt;
+      return (
+        checkedOrder ||
+        left.firstSeenAtMs - right.firstSeenAtMs ||
+        left.tokenAddress.localeCompare(right.tokenAddress)
+      );
+    });
+    for (const candidate of ordered) {
       const key = `${candidate.chain}:${candidate.tokenAddress}`;
       const lastAt = this.radarLastAt.get(key);
       if (lastAt !== undefined && nowMs - lastAt < QUALIFICATION_REFRESH_MS) continue;
@@ -335,7 +352,26 @@ export class BotRuntime {
                     ? 'heat_wait'
                     : undefined;
       if (stage === undefined) continue;
-      await this.deliverRadar(candidate, latestFresh ? latest : undefined, existing?.payload, stage);
+      const result = await this.deliverRadar(
+        candidate,
+        latestFresh ? latest : undefined,
+        existing?.payload,
+        stage
+      );
+      if (
+        result === undefined ||
+        result.outcome === 'DUPLICATE' ||
+        result.reason === 'radar edit retry limit reached'
+      ) continue;
+      const retryAfterSeconds = result.reason?.match(/retry after (\d+)/i)?.[1];
+      const retryAfterMs = retryAfterSeconds === undefined
+        ? 0
+        : Number.parseInt(retryAfterSeconds, 10) * 1_000;
+      this.radarNextDeliveryAtMs = this.now() + Math.max(
+        RADAR_DELIVERY_MIN_INTERVAL_MS,
+        retryAfterMs
+      );
+      return;
     }
   }
 
@@ -344,7 +380,7 @@ export class BotRuntime {
     latestRank: ReturnType<RankSnapshotRepository['findLatest']>,
     existingPayload: unknown,
     stage: RadarMessageSnapshot['stage']
-  ): Promise<void> {
+  ): Promise<DeliveryResult | undefined> {
     const raw =
       latestRank?.raw !== null && typeof latestRank?.raw === 'object' && !Array.isArray(latestRank.raw)
         ? (latestRank.raw as Readonly<Record<string, unknown>>)
@@ -391,7 +427,13 @@ export class BotRuntime {
       return;
     }
     const result = await this.delivery.sendRadar(snapshot, this.abortController.signal);
-    this.emit({ event: 'radar_delivery', chain: candidate.chain, outcome: result.outcome });
+    this.emit({
+      event: 'radar_delivery',
+      chain: candidate.chain,
+      outcome: result.outcome,
+      ...(result.reason === undefined ? {} : { reason: result.reason })
+    });
+    return result;
   }
 
   private async processQualification(actionable: readonly CandidateRecord[]): Promise<void> {

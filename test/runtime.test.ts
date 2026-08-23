@@ -11,7 +11,10 @@ import {
   RuleVersionRepository
 } from '../src/db/repositories.js';
 import { BotRuntime } from '../src/runtime/service.js';
-import type { TelegramTransportLike } from '../src/telegram/transport.js';
+import {
+  TelegramExplicitError,
+  type TelegramTransportLike
+} from '../src/telegram/transport.js';
 
 const TOKEN = '0xabcdef0000000000000000000000000000000001';
 const POOL = '0xabcdef0000000000000000000000000000000002';
@@ -73,6 +76,7 @@ test('runtime edits one radar through current-rank omission and lifecycle change
 
   const sends: string[] = [];
   const edits: string[] = [];
+  const editErrors: unknown[] = [];
   const telegram: TelegramTransportLike = {
     async sendMessage(_chatId: string, text: string) {
       sends.push(text);
@@ -84,6 +88,8 @@ test('runtime edits one radar through current-rank omission and lifecycle change
       text: string
     ) {
       edits.push(text);
+      const error = editErrors.shift();
+      if (error !== undefined) throw error;
     }
   };
   const runtime = new BotRuntime(database, config, {
@@ -107,8 +113,19 @@ test('runtime edits one radar through current-rank omission and lifecycle change
     chain: 'bsc', interval: '1m', fetchedAtMs: now.value,
     itemCount: 0, discoveryRuleVersion: config.ruleVersion
   });
+  editErrors.push(
+    new TelegramExplicitError(429, 429, 'Too Many Requests: retry after 10')
+  );
   await processRadar();
   assert.match(edits[0]!, /热度暂时不足/);
+
+  now.value += 3_000;
+  await processRadar();
+  assert.equal(edits.length, 1);
+
+  now.value += 7_000;
+  await processRadar();
+  assert.match(edits[1]!, /热度暂时不足/);
 
   now.value += 3_000;
   insertCurrent(now.value);
@@ -118,7 +135,7 @@ test('runtime edits one radar through current-rank omission and lifecycle change
   });
   candidates.transition('bsc', TOKEN, 'PREHEAT', { atMs: now.value });
   await processRadar();
-  assert.match(edits[1]!, /真实池验证中/);
+  assert.match(edits[2]!, /真实池验证中/);
 
   new PoolBindingRepository(database).bind({
     chain: 'bsc', tokenAddress: TOKEN, poolAddress: POOL,
@@ -128,8 +145,47 @@ test('runtime edits one radar through current-rank omission and lifecycle change
   candidates.transition('bsc', TOKEN, 'SIGNAL_SENT', { atMs: now.value });
   now.value += 3_000;
   await processRadar();
-  assert.match(edits[2]!, /已通过正式资格/);
+  assert.match(edits[3]!, /已通过正式资格/);
   assert.equal(sends.length, 1);
-  assert.equal(edits.length, 3);
+  assert.equal(edits.length, 4);
+
+  const fairTokens = [4, 5, 6, 7].map(
+    (suffix) => `0xabcdef000000000000000000000000000000000${suffix}`
+  );
+  now.value += 1_200;
+  for (const [index, tokenAddress] of fairTokens.entries()) {
+    candidates.findOrCreate({
+      chain: 'bsc',
+      tokenAddress,
+      firstSeenAtMs: now.value + index,
+      firstSeenPriceUsd: 0.001,
+      firstSeenRank: index + 1,
+      firstSeenMarketCapUsd: 80_000,
+      firstSeenLiquidityUsd: 12_000,
+      discoveryRuleVersion: config.ruleVersion
+    });
+    candidates.transition('bsc', tokenAddress, 'RADAR', { atMs: now.value });
+    snapshots.insert({
+      chain: 'bsc',
+      interval: '1m',
+      fetchedAtMs: now.value,
+      tokenAddress,
+      rank: index + 1,
+      priceUsd: 0.001,
+      marketCapUsd: 80_000,
+      liquidityUsd: 12_000,
+      raw: { name: `Fair Meme ${index + 1}`, symbol: `F${index + 1}` }
+    });
+  }
+  fetches.insert({
+    chain: 'bsc', interval: '1m', fetchedAtMs: now.value,
+    itemCount: fairTokens.length, discoveryRuleVersion: config.ruleVersion
+  });
+  for (const tokenAddress of fairTokens) {
+    await processRadar();
+    assert.match(sends.at(-1)!, new RegExp(tokenAddress));
+    now.value += 1_200;
+  }
+  assert.equal(sends.length, 1 + fairTokens.length);
   database.close();
 });
