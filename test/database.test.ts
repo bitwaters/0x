@@ -56,7 +56,7 @@ function seedBscCandidate(database = openDatabase(':memory:')) {
   return { database, rules, candidates, candidate };
 }
 
-function openV6Database(path: string): DatabaseSync {
+function openVersionDatabase(path: string, maximumVersion: number): DatabaseSync {
   const database = new DatabaseSync(path);
   database.exec(`
     PRAGMA foreign_keys = ON;
@@ -70,7 +70,7 @@ function openV6Database(path: string): DatabaseSync {
   const insert = database.prepare(
     'INSERT INTO _migrations(version, name, checksum, applied_at_ms) VALUES (?, ?, ?, ?)'
   );
-  for (const migration of MIGRATIONS.filter((item) => item.version <= 6)) {
+  for (const migration of MIGRATIONS.filter((item) => item.version <= maximumVersion)) {
     database.exec(migration.sql);
     insert.run(
       migration.version,
@@ -80,6 +80,10 @@ function openV6Database(path: string): DatabaseSync {
     );
   }
   return database;
+}
+
+function openV6Database(path: string): DatabaseSync {
+  return openVersionDatabase(path, 6);
 }
 
 test('creates all migrations and enables WAL for file databases', () => {
@@ -121,6 +125,91 @@ test('normalizes BSC addresses and validates decoded SOL address length', () => 
   assert.throws(() => normalizeAddress('bsc', '0x1234'), /20-byte/);
   assert.throws(() => normalizeAddress('sol', '0OIl'), /non-base58/);
   assert.throws(() => normalizeAddress('sol', '1111'), /exactly 32 bytes/);
+});
+
+test('persistent trigger evidence fails closed on missing or out-of-range batches', () => {
+  const database = openDatabase(':memory:');
+  new RuleVersionRepository(database).save('rules-evidence', {}, 1);
+  const snapshots = new RankSnapshotRepository(database);
+  const fetches = new RankSnapshotFetchRepository(database);
+  const insert = (
+    interval: '1m' | '5m',
+    fetchedAtMs: number,
+    rank: number,
+    marketCapUsd = 80_000
+  ) => {
+    snapshots.insert({
+      chain: 'sol', interval, fetchedAtMs, tokenAddress: SOL_TOKEN,
+      rank, priceUsd: 0.001, marketCapUsd, liquidityUsd: 12_000, raw: {}
+    });
+    fetches.insert({
+      chain: 'sol', interval, fetchedAtMs, itemCount: 1,
+      discoveryRuleVersion: 'rules-evidence'
+    });
+  };
+
+  insert('1m', 1_000, 5);
+  insert('5m', 2_000, 5);
+  insert('1m', 4_000, 4);
+  assert.equal(
+    snapshots.hasCurrentTriggerEvidence('sol', SOL_TOKEN, ['DUAL_RANK'], 4_000),
+    true
+  );
+
+  fetches.insert({
+    chain: 'sol', interval: '5m', fetchedAtMs: 4_500, itemCount: 0,
+    discoveryRuleVersion: 'rules-evidence'
+  });
+  assert.equal(
+    snapshots.hasCurrentTriggerEvidence('sol', SOL_TOKEN, ['DUAL_RANK'], 5_000),
+    false
+  );
+
+  insert('5m', 11_000, 4, 300_001);
+  insert('1m', 12_000, 4);
+  insert('1m', 15_000, 3);
+  assert.equal(
+    snapshots.hasCurrentTriggerEvidence('sol', SOL_TOKEN, ['DUAL_RANK'], 15_000),
+    false
+  );
+
+  insert('1m', 50_000, 5);
+  insert('5m', 53_000, 5);
+  insert('5m', 60_000, 4);
+  insert('1m', 61_000, 4);
+  assert.equal(
+    snapshots.hasCurrentTriggerEvidence('sol', SOL_TOKEN, ['DUAL_RANK'], 61_000),
+    true
+  );
+
+  insert('1m', 70_000, 5);
+  insert('1m', 73_000, 4);
+  insert('5m', 73_000, 4);
+  assert.equal(
+    snapshots.hasCurrentTriggerEvidence('sol', SOL_TOKEN, ['DUAL_RANK'], 73_000),
+    false
+  );
+
+  insert('1m', 80_000, 9);
+  insert('1m', 83_000, 7);
+  insert('1m', 86_000, 5);
+  assert.equal(
+    snapshots.hasCurrentTriggerEvidence('sol', SOL_TOKEN, ['THREE_RISING_1M'], 86_000),
+    true
+  );
+  assert.equal(
+    snapshots.hasCurrentTriggerEvidence('sol', SOL_TOKEN, ['THREE_RISING_1M'], 85_000),
+    false
+  );
+  fetches.insert({
+    chain: 'sol', interval: '1m', fetchedAtMs: 89_000, itemCount: 0,
+    discoveryRuleVersion: 'rules-evidence'
+  });
+  assert.equal(
+    snapshots.hasCurrentTriggerEvidence('sol', SOL_TOKEN, ['THREE_RISING_1M'], 89_000),
+    false
+  );
+  database.close();
 });
 
 test('keeps first-seen values immutable and permanently rejects chase-limit candidates', () => {
@@ -552,6 +641,198 @@ test('v7 upgrades a v6 file atomically and bridges only pre-upgrade BSC bonding 
     false
   );
   assert.equal(failed.prepare('SELECT count(*) AS count FROM _migrations WHERE version = 7').get()!.count, 0);
+  failed.close();
+});
+
+test('v8 atomically bridges only current unactivated SOL bonding radar facts', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'meme-signal-v8-'));
+  const path = join(directory, 'state.db');
+  const v7 = openVersionDatabase(path, 7);
+  new RuleVersionRepository(v7).save('rules-old', {}, 1);
+  const candidates = new CandidateRepository(v7);
+  const events = new QualificationEventRepository(v7);
+  const activatedToken = '11111111111111111111111111111111';
+  const resetToken = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+  for (const tokenAddress of [SOL_TOKEN, activatedToken, resetToken]) {
+    candidates.findOrCreate({
+      chain: 'sol', tokenAddress, firstSeenAtMs: 100,
+      firstSeenPriceUsd: 0.001, firstSeenRank: 5,
+      firstSeenMarketCapUsd: 30_000, firstSeenLiquidityUsd: 0,
+      discoveryRuleVersion: 'rules-old'
+    });
+    candidates.transition('sol', tokenAddress, 'RADAR', { atMs: 120 });
+    events.record({
+      chain: 'sol', tokenAddress, stage: 'activation', outcome: 'WAIT',
+      reasonCode: 'DUAL_RANK_BONDING_CURVE', source: 'gmgn', observedAtMs: 130,
+      raw: { tokenAddress }, normalized: {}, thresholds: {},
+      decisionRuleVersion: 'rules-old'
+    });
+  }
+  candidates.activate({
+    chain: 'sol', tokenAddress: activatedToken, opportunityType: 'new_pool',
+    priceUsd: 0.001, ruleVersion: 'rules-old', atMs: 140
+  });
+  candidates.transition('sol', activatedToken, 'PREHEAT', { atMs: 140 });
+  const pools = new PoolBindingRepository(v7);
+  pools.bind({
+    chain: 'sol', tokenAddress: activatedToken, poolAddress: SOL_TOKEN,
+    candidateSide: 'base', counterTokenAddress: resetToken, boundAtMs: 150
+  });
+  pools.setQualificationReference({
+    chain: 'sol', tokenAddress: activatedToken, priceUsd: 0.001, atMs: 160
+  });
+  v7.prepare(`
+    UPDATE candidates SET legacy_reopened_at_ms = 200
+    WHERE chain = 'sol' AND token_address = ?
+  `).run(resetToken);
+  events.record({
+    chain: 'sol', tokenAddress: resetToken, stage: 'bonding_shortcut_readiness',
+    outcome: 'PASS', reasonCode: 'BONDING_POOL_OPEN_SHORTCUT_READY', source: 'gmgn',
+    observedAtMs: 130, raw: { source: 'before-reset' }, normalized: {}, thresholds: {},
+    decisionRuleVersion: 'rules-old'
+  });
+  events.record({
+    chain: 'sol', tokenAddress: resetToken, stage: 'activation', outcome: 'WAIT',
+    reasonCode: 'THREE_RISING_1M_BONDING_CURVE', source: 'gmgn', observedAtMs: 230,
+    raw: { source: 'after-reset' }, normalized: {}, thresholds: {},
+    decisionRuleVersion: 'rules-old'
+  });
+  const terminalToken = 'SysvarRent111111111111111111111111111111111';
+  candidates.findOrCreate({
+    chain: 'sol', tokenAddress: terminalToken, firstSeenAtMs: 100,
+    firstSeenPriceUsd: 0.001, firstSeenRank: 20,
+    firstSeenMarketCapUsd: 30_000, firstSeenLiquidityUsd: 12_000,
+    discoveryRuleVersion: 'rules-old'
+  });
+  candidates.transition('sol', terminalToken, 'REJECTED', {
+    atMs: 170, terminalReason: 'SECURITY_REJECTED'
+  });
+  const outbox = new OutboxRepository(v7);
+  const signal = outbox.create({
+    chain: 'sol', tokenAddress: activatedToken, messageKind: 'signal',
+    channelRole: 'validation', payload: { text: 'preserved signal' }, createdAtMs: 180
+  });
+  outbox.claim(signal.id, 181);
+  outbox.markSent(signal.id, 'preserved-message', 182);
+  const sample = v7.prepare(`
+    INSERT INTO delivered_signal_samples(
+      outbox_id, chain, token_address, delivery_stage, receipt_at_ms,
+      pre_send_price_usd, pre_send_trade_at_ms, entry_status,
+      discovery_rule_version, decision_rule_version,
+      validation_epoch, validation_seq, snapshot_json, created_at_ms, updated_at_ms
+    ) VALUES (?, 'sol', ?, 'validation', 182, 0.001, 181, 'PENDING',
+      'rules-old', 'rules-old', 3, 7, '{}', 182, 182)
+  `).run(signal.id, activatedToken);
+  v7.prepare(`
+    INSERT INTO signal_evaluation_points(
+      sample_id, horizon_seconds, scheduled_at_ms, next_attempt_at_ms,
+      status, retry_count, details_json, updated_at_ms
+    ) VALUES (?, 900, 1082, 1082, 'PENDING', 0, '{}', 182)
+  `).run(Number(sample.lastInsertRowid));
+  v7.prepare(`
+    INSERT INTO evaluation_reports(
+      chain, decision_rule_version, kind, boundary_count, generated_at_ms, snapshot_json
+    ) VALUES ('sol', 'rules-old', 'MILESTONE', 5, 183, '{}')
+  `).run();
+  v7.prepare(`
+    UPDATE chain_release_state
+    SET state = 'BETA', validation_epoch = 3, next_validation_seq = 8, updated_at_ms = 184
+    WHERE chain = 'sol'
+  `).run();
+  const preservedTables = [
+    'candidates', 'pool_bindings', 'message_outbox', 'delivered_signal_samples',
+    'signal_evaluation_points', 'evaluation_reports', 'chain_release_state'
+  ] as const;
+  const preservedBefore = new Map(preservedTables.map((table) => [
+    table,
+    JSON.stringify(v7.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all())
+  ]));
+  v7.close();
+
+  const upgraded = openDatabase(path);
+  const bridges = upgraded.prepare(`
+    SELECT token_address, observed_at_ms, raw_json
+    FROM qualification_events
+    WHERE chain = 'sol' AND stage = 'bonding_shortcut_readiness'
+    ORDER BY token_address, observed_at_ms
+  `).all() as Array<Record<string, unknown>>;
+  assert.deepEqual(bridges.map((row) => ({ ...row })), [
+    {
+      token_address: SOL_TOKEN,
+      observed_at_ms: 130,
+      raw_json: `{"tokenAddress":"${SOL_TOKEN}"}`
+    },
+    {
+      token_address: resetToken,
+      observed_at_ms: 130,
+      raw_json: '{"source":"before-reset"}'
+    },
+    {
+      token_address: resetToken,
+      observed_at_ms: 230,
+      raw_json: '{"source":"after-reset"}'
+    }
+  ]);
+  assert.equal(
+    upgraded.prepare('SELECT count(*) AS count FROM _migrations WHERE version = 8').get()!.count,
+    1
+  );
+  new RuleVersionRepository(upgraded).save('rules-new', {
+    discoveryPolicy: 'sol-public-only-change',
+    qualificationPolicy: 'unchanged',
+    evaluationPolicy: 'unchanged'
+  }, 500);
+  assert.equal(new CandidateRepository(upgraded).reopenEligibleLegacy('rules-new', 500), 0);
+  for (const table of preservedTables) {
+    assert.equal(
+      JSON.stringify(upgraded.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()),
+      preservedBefore.get(table),
+      `${table} changed during v8 upgrade`
+    );
+  }
+  assert.equal(
+    upgraded.prepare('SELECT count(*) AS count FROM rule_versions').get()!.count,
+    2
+  );
+  upgraded.close();
+  const reopened = openDatabase(path);
+  assert.equal(reopened.prepare(`
+    SELECT count(*) AS count FROM qualification_events
+    WHERE chain = 'sol' AND stage = 'bonding_shortcut_readiness'
+  `).get()!.count, 3);
+  reopened.close();
+
+  const failedPath = join(directory, 'failed.db');
+  const failedV7 = openVersionDatabase(failedPath, 7);
+  new RuleVersionRepository(failedV7).save('rules-old', {}, 1);
+  const failedCandidates = new CandidateRepository(failedV7);
+  failedCandidates.findOrCreate({
+    chain: 'sol', tokenAddress: SOL_TOKEN, firstSeenAtMs: 100,
+    firstSeenPriceUsd: 0.001, firstSeenRank: 5,
+    firstSeenMarketCapUsd: 30_000, firstSeenLiquidityUsd: 0,
+    discoveryRuleVersion: 'rules-old'
+  });
+  failedCandidates.transition('sol', SOL_TOKEN, 'RADAR', { atMs: 120 });
+  new QualificationEventRepository(failedV7).record({
+    chain: 'sol', tokenAddress: SOL_TOKEN, stage: 'activation', outcome: 'WAIT',
+    reasonCode: 'DUAL_RANK_BONDING_CURVE', source: 'gmgn', observedAtMs: 130,
+    raw: {}, normalized: {}, thresholds: {}, decisionRuleVersion: 'rules-old'
+  });
+  failedV7.exec(`
+    CREATE TRIGGER fail_v8_bridge BEFORE INSERT ON qualification_events
+    WHEN NEW.stage = 'bonding_shortcut_readiness'
+    BEGIN SELECT RAISE(ABORT, 'fixture migration failure'); END;
+  `);
+  failedV7.close();
+  assert.throws(() => openDatabase(failedPath), /fixture migration failure/);
+  const failed = new DatabaseSync(failedPath);
+  assert.equal(failed.prepare(
+    'SELECT count(*) AS count FROM _migrations WHERE version = 8'
+  ).get()!.count, 0);
+  assert.equal(failed.prepare(`
+    SELECT count(*) AS count FROM qualification_events
+    WHERE stage = 'bonding_shortcut_readiness'
+  `).get()!.count, 0);
   failed.close();
 });
 

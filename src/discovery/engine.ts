@@ -169,29 +169,32 @@ export class CandidateDiscoveryEngine {
             item.tokenAddress,
             nowMs
           );
-          const publicReady =
-            dualCount >= DISCOVERY_POLICY.consecutiveDualSnapshotCount ||
-            risingUpdate.activated.has(item.tokenAddress);
+          const risingReady = risingUpdate.activated.has(item.tokenAddress);
           const radarOpened =
             item.openAtMs !== null &&
-            (snapshot.chain === 'bsc'
-              ? this.events.has({
-                  chain: snapshot.chain,
-                  tokenAddress: item.tokenAddress,
-                  stage: 'bonding_shortcut_readiness',
-                  reasonCode: 'BONDING_POOL_OPEN_SHORTCUT_READY'
-                })
-              : candidate.status === 'RADAR');
+            this.events.has({
+              chain: snapshot.chain,
+              tokenAddress: item.tokenAddress,
+              stage: 'bonding_shortcut_readiness',
+              reasonCode: 'BONDING_POOL_OPEN_SHORTCUT_READY',
+              ...(candidate.legacyReopenedAtMs === null
+                ? {}
+                : { observedAfterMs: candidate.legacyReopenedAtMs })
+            });
           const reason =
             radarOpened
               ? 'RADAR_OPENED'
-              : dualCount >= 1
+              : dualCount >= DISCOVERY_POLICY.consecutiveDualSnapshotCount
                 ? 'DUAL_RANK'
-                : risingUpdate.activated.has(item.tokenAddress)
+                : risingReady
                   ? 'THREE_RISING_1M'
+                  : dualCount >= 1
+                    ? 'DUAL_RANK'
                   : undefined;
+          const sustainedHeat =
+            dualCount >= DISCOVERY_POLICY.consecutiveDualSnapshotCount || risingReady;
           if (reason !== undefined && this.canResolve(snapshot.chain, item.tokenAddress, nowMs)) {
-            activationWork.push({ item, reason, publicReady });
+            activationWork.push({ item, reason, publicReady: sustainedHeat });
           }
         }
       });
@@ -391,7 +394,6 @@ export class CandidateDiscoveryEngine {
         latestOneMinute.marketCapUsd >= DISCOVERY_POLICY.bondingRadarMarketCapUsd.min &&
         latestOneMinute.marketCapUsd <= DISCOVERY_POLICY.bondingRadarMarketCapUsd.max;
       const shortcutReady =
-        chain === 'bsc' &&
         publicReady &&
         latestOneMinute.rank <= DISCOVERY_POLICY.bondingShortcutRankMax &&
         bondingMarketCap;
@@ -414,20 +416,22 @@ export class CandidateDiscoveryEngine {
             marketCapUsd: DISCOVERY_POLICY.bondingRadarMarketCapUsd
           },
           decisionRuleVersion: this.config.ruleVersion
-        }, false);
+        }, false, eligible.legacyReopenedAtMs ?? undefined);
       }
       const bondingPublic =
         publicReady &&
+        reason !== 'RADAR_OPENED' &&
+        publicPolicy.bondingTriggers.some((trigger) => trigger === reason) &&
         latestOneMinute.rank >= publicPolicy.bondingRank.min &&
         latestOneMinute.rank <= publicPolicy.bondingRank.max &&
         bondingMarketCap;
-      if (chain === 'bsc' && bondingPublic) {
+      if (bondingPublic) {
         this.events.recordOnce({
           chain,
           tokenAddress: item.tokenAddress,
           stage: 'radar_public_readiness',
           outcome: 'PASS',
-          reasonCode: 'BSC_RADAR_PUBLIC_READY',
+          reasonCode: `${chain.toUpperCase()}_RADAR_PUBLIC_READY`,
           source: 'gmgn',
           observedAtMs,
           raw: info.raw,

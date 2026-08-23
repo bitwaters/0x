@@ -1,6 +1,7 @@
 import type { Chain } from '../config.js';
 import { normalizeAddress } from '../domain/address.js';
 import { stableJsonStringify } from '../domain/json.js';
+import { DISCOVERY_POLICY } from '../discovery/policy.js';
 import type { SqliteDatabase } from './database.js';
 import { withTransaction } from './database.js';
 
@@ -673,6 +674,162 @@ export class RankSnapshotRepository {
     `).get(chain, interval) as { fetched_at_ms: number } | undefined;
     return row?.fetched_at_ms;
   }
+
+  hasCurrentTriggerEvidence(
+    chain: Chain,
+    tokenAddress: string,
+    triggers: readonly ('DUAL_RANK' | 'THREE_RISING_1M')[],
+    nowMs: number
+  ): boolean {
+    const token = normalizeAddress(chain, tokenAddress);
+    return triggers.some((trigger) =>
+      trigger === 'DUAL_RANK'
+        ? this.hasConsecutiveDualEvidence(chain, token, nowMs)
+        : this.hasThreeRisingEvidence(chain, token, nowMs)
+    );
+  }
+
+  private recentFetches(
+    chain: Chain,
+    interval: '1m' | '5m',
+    limit: number,
+    atOrBeforeMs = Number.MAX_SAFE_INTEGER
+  ): number[] {
+    return (this.database.prepare(`
+      SELECT fetched_at_ms
+      FROM rank_snapshot_fetches
+      WHERE chain = ? AND interval = ? AND fetched_at_ms <= ?
+      ORDER BY fetched_at_ms DESC
+      LIMIT ?
+    `).all(chain, interval, atOrBeforeMs, limit) as Array<{ fetched_at_ms: number }>)
+      .map((row) => row.fetched_at_ms);
+  }
+
+  private fetchesBetween(
+    chain: Chain,
+    interval: '1m' | '5m',
+    afterMs: number,
+    beforeMs: number
+  ): number[] {
+    return (this.database.prepare(`
+      SELECT fetched_at_ms
+      FROM rank_snapshot_fetches
+      WHERE chain = ? AND interval = ?
+        AND fetched_at_ms > ? AND fetched_at_ms < ?
+      ORDER BY fetched_at_ms
+    `).all(chain, interval, afterMs, beforeMs) as Array<{ fetched_at_ms: number }>)
+      .map((row) => row.fetched_at_ms);
+  }
+
+  private snapshotAt(
+    chain: Chain,
+    tokenAddress: string,
+    interval: '1m' | '5m',
+    fetchedAtMs: number
+  ): Pick<RankSnapshotRecord, 'rank' | 'marketCapUsd'> | undefined {
+    const row = this.database.prepare(`
+      SELECT rank, market_cap_usd
+      FROM rank_snapshots
+      WHERE chain = ? AND token_address = ? AND interval = ? AND fetched_at_ms = ?
+      LIMIT 1
+    `).get(chain, tokenAddress, interval, fetchedAtMs) as
+      | { rank: number; market_cap_usd: number }
+      | undefined;
+    return row === undefined ? undefined : { rank: row.rank, marketCapUsd: row.market_cap_usd };
+  }
+
+  private withinInternalMarketCap(value: number): boolean {
+    return value >= DISCOVERY_POLICY.internalMarketCapUsd.min &&
+      value <= DISCOVERY_POLICY.internalMarketCapUsd.max;
+  }
+
+  private hasConsecutiveDualEvidence(
+    chain: Chain,
+    tokenAddress: string,
+    nowMs: number
+  ): boolean {
+    const oneMinuteFetches = this.recentFetches(chain, '1m', 2);
+    if (oneMinuteFetches.length !== 2) return false;
+    const [firstOneMinuteAt, secondOneMinuteAt] = [...oneMinuteFetches].reverse();
+    const validPair = (oneMinuteAt: number, fiveMinuteAt: number, evaluatedAtMs: number) => {
+      const oneMinute = this.snapshotAt(chain, tokenAddress, '1m', oneMinuteAt);
+      const fiveMinute = this.snapshotAt(chain, tokenAddress, '5m', fiveMinuteAt);
+      return (
+        oneMinute !== undefined &&
+        fiveMinute !== undefined &&
+        evaluatedAtMs >= oneMinuteAt &&
+        evaluatedAtMs >= fiveMinuteAt &&
+        evaluatedAtMs - oneMinuteAt <= DISCOVERY_POLICY.snapshotMaxAgeMs['1m'] &&
+        evaluatedAtMs - fiveMinuteAt <= DISCOVERY_POLICY.snapshotMaxAgeMs['5m'] &&
+        Math.abs(oneMinuteAt - fiveMinuteAt) <=
+          DISCOVERY_POLICY.dualSnapshotMaxDifferenceMs &&
+        this.withinInternalMarketCap(oneMinute.marketCapUsd) &&
+        this.withinInternalMarketCap(fiveMinute.marketCapUsd)
+      );
+    };
+    const firstPriorFiveMinuteAt = this.recentFetches(
+      chain, '5m', 1, firstOneMinuteAt! - 1
+    )[0];
+    const firstPaired = (
+      firstPriorFiveMinuteAt !== undefined &&
+      validPair(firstOneMinuteAt!, firstPriorFiveMinuteAt, firstOneMinuteAt!)
+    ) || this.fetchesBetween(
+      chain,
+      '5m',
+      firstOneMinuteAt!,
+      Math.min(
+        secondOneMinuteAt!,
+        firstOneMinuteAt! + DISCOVERY_POLICY.snapshotMaxAgeMs['1m'] + 1
+      )
+    ).some((fiveMinuteAt) => validPair(firstOneMinuteAt!, fiveMinuteAt, fiveMinuteAt));
+    const secondFiveMinuteAt = this.recentFetches(
+      chain, '5m', 1, secondOneMinuteAt! - 1
+    )[0];
+    const currentFiveMinuteAt = this.recentFetches(chain, '5m', 1, nowMs)[0];
+    const currentFiveMinute = currentFiveMinuteAt === undefined
+      ? undefined
+      : this.snapshotAt(chain, tokenAddress, '5m', currentFiveMinuteAt);
+    return (
+      firstPaired &&
+      secondFiveMinuteAt !== undefined &&
+      validPair(secondOneMinuteAt!, secondFiveMinuteAt, secondOneMinuteAt!) &&
+      currentFiveMinuteAt !== undefined &&
+      currentFiveMinute !== undefined &&
+      this.withinInternalMarketCap(currentFiveMinute.marketCapUsd) &&
+      Math.abs(secondOneMinuteAt! - currentFiveMinuteAt) <=
+        DISCOVERY_POLICY.dualSnapshotMaxDifferenceMs &&
+      nowMs >= secondOneMinuteAt! &&
+      nowMs >= currentFiveMinuteAt &&
+      nowMs - secondOneMinuteAt! <= DISCOVERY_POLICY.snapshotMaxAgeMs['1m'] &&
+      nowMs - currentFiveMinuteAt <= DISCOVERY_POLICY.snapshotMaxAgeMs['5m']
+    );
+  }
+
+  private hasThreeRisingEvidence(
+    chain: Chain,
+    tokenAddress: string,
+    nowMs: number
+  ): boolean {
+    const fetches = this.recentFetches(chain, '1m', 3);
+    if (
+      fetches.length !== DISCOVERY_POLICY.risingSnapshotCount ||
+      nowMs < fetches[0]! ||
+      nowMs - fetches[0]! > DISCOVERY_POLICY.snapshotMaxAgeMs['1m']
+    ) return false;
+    const rows = [...fetches].reverse().map((fetchedAtMs) => ({
+      fetchedAtMs,
+      snapshot: this.snapshotAt(chain, tokenAddress, '1m', fetchedAtMs)
+    }));
+    return rows.every((row, index) =>
+      row.snapshot !== undefined &&
+      this.withinInternalMarketCap(row.snapshot.marketCapUsd) &&
+      (index === 0 || (
+        row.fetchedAtMs - rows[index - 1]!.fetchedAtMs <=
+          DISCOVERY_POLICY.risingMaxGapMs &&
+        row.snapshot.rank < rows[index - 1]!.snapshot!.rank
+      ))
+    );
+  }
 }
 
 export class RankSnapshotFetchRepository {
@@ -933,6 +1090,7 @@ export class QualificationEventRepository {
     readonly stage: string;
     readonly reasonCode: string;
     readonly decisionRuleVersion?: string;
+    readonly observedAfterMs?: number;
   }): boolean {
     return this.database
       .prepare(`
@@ -940,6 +1098,7 @@ export class QualificationEventRepository {
         FROM qualification_events
         WHERE chain = ? AND token_address = ? AND stage = ? AND reason_code = ?
           AND (? IS NULL OR decision_rule_version = ?)
+          AND (? IS NULL OR observed_at_ms > ?)
         LIMIT 1
       `)
       .get(
@@ -948,7 +1107,9 @@ export class QualificationEventRepository {
         input.stage,
         input.reasonCode,
         input.decisionRuleVersion ?? null,
-        input.decisionRuleVersion ?? null
+        input.decisionRuleVersion ?? null,
+        input.observedAfterMs ?? null,
+        input.observedAfterMs ?? null
       ) !== undefined;
   }
 
@@ -964,7 +1125,7 @@ export class QualificationEventRepository {
     readonly normalized: unknown;
     readonly thresholds: unknown;
     readonly decisionRuleVersion: string;
-  }, versionScoped = true): number | undefined {
+  }, versionScoped = true, observedAfterMs?: number): number | undefined {
     const result = this.database.prepare(`
       INSERT INTO qualification_events(
         chain, token_address, stage, outcome, reason_code, source,
@@ -976,6 +1137,7 @@ export class QualificationEventRepository {
         SELECT 1 FROM qualification_events
         WHERE chain = ? AND token_address = ? AND stage = ? AND reason_code = ?
           AND (? = 0 OR decision_rule_version = ?)
+          AND (? IS NULL OR observed_at_ms > ?)
       )
     `).run(
       input.chain,
@@ -994,7 +1156,9 @@ export class QualificationEventRepository {
       input.stage,
       input.reasonCode,
       versionScoped ? 1 : 0,
-      input.decisionRuleVersion
+      input.decisionRuleVersion,
+      observedAfterMs ?? null,
+      observedAfterMs ?? null
     );
     return result.changes === 1 ? Number(result.lastInsertRowid) : undefined;
   }

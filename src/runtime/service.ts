@@ -322,8 +322,19 @@ export class BotRuntime {
       const latestFresh =
         latest !== undefined &&
         latest.fetchedAtMs === currentFetchAt &&
+        nowMs >= latest.fetchedAtMs &&
         nowMs - latest.fetchedAtMs <= DISCOVERY_POLICY.snapshotMaxAgeMs['1m'];
       const publicPolicy = DISCOVERY_POLICY.publicRadar[candidate.chain];
+      const readinessReason = `${candidate.chain.toUpperCase()}_RADAR_PUBLIC_READY`;
+      const initialSnapshot = existing?.initialPayload?.payload.snapshot;
+      const initialStage =
+        initialSnapshot !== null &&
+        typeof initialSnapshot === 'object' &&
+        !Array.isArray(initialSnapshot) &&
+        typeof (initialSnapshot as { readonly stage?: unknown }).stage === 'string'
+          ? (initialSnapshot as { readonly stage: string }).stage
+          : undefined;
+      const sentBonding = existing?.status === 'SENT' && initialStage === 'bonding';
       const bondingPublic =
         candidate.status === 'RADAR' &&
         latestFresh &&
@@ -332,17 +343,15 @@ export class BotRuntime {
           latest.marketCapUsd >= DISCOVERY_POLICY.bondingRadarMarketCapUsd.min &&
           latest.marketCapUsd <= DISCOVERY_POLICY.bondingRadarMarketCapUsd.max;
       const opportunityPublic =
-        candidate.chain === 'sol' ||
         candidate.opportunityType === 'new_pool' ||
         (candidate.opportunityType === 'revival' && publicPolicy.revivalPublic);
       const activationEvidence =
-        candidate.chain === 'sol' ||
-        (candidate.activationAtMs !== null &&
-          this.qualificationEvents.hasRealPoolActivationEvidence(
-            candidate.chain,
-            candidate.tokenAddress
-          ));
-      const realPoolPublic =
+        candidate.activationAtMs !== null &&
+        this.qualificationEvents.hasRealPoolActivationEvidence(
+          candidate.chain,
+          candidate.tokenAddress
+        );
+      const realPoolEligible =
         ['PREHEAT', 'POOL_BOUND', 'MONITORING'].includes(candidate.status) &&
         activationEvidence &&
         opportunityPublic &&
@@ -353,13 +362,22 @@ export class BotRuntime {
         latest.marketCapUsd <= DISCOVERY_POLICY.realPoolMarketCapUsd.max &&
         latest.liquidityUsd !== null &&
         latest.liquidityUsd >= this.config.thresholds.liquidityMinUsd;
-      if (candidate.chain === 'bsc' && realPoolPublic && existing?.status !== 'SENT') {
+      const realPoolPublic =
+        realPoolEligible &&
+        (existing?.status === 'SENT'
+          ? candidate.chain === 'bsc' || sentBonding
+          : publicPolicy.directRealPool);
+      if (
+        realPoolEligible &&
+        publicPolicy.directRealPool &&
+        existing?.status !== 'SENT'
+      ) {
         this.qualificationEvents.recordOnce({
           chain: candidate.chain,
           tokenAddress: candidate.tokenAddress,
           stage: 'radar_public_readiness',
           outcome: 'PASS',
-          reasonCode: 'BSC_RADAR_PUBLIC_READY',
+          reasonCode: readinessReason,
           source: 'gmgn',
           observedAtMs: latest!.fetchedAtMs,
           raw: latest!.raw,
@@ -390,29 +408,44 @@ export class BotRuntime {
               : undefined;
       const revivalSuppressed =
         candidate.opportunityType === 'revival' && !publicPolicy.revivalPublic;
-      let stage: RadarMessageSnapshot['stage'] | undefined =
-        terminalStage ??
-        (revivalSuppressed
+      let stage: RadarMessageSnapshot['stage'] | undefined;
+      if (terminalStage !== undefined) {
+        stage = existing?.status === 'SENT' ? terminalStage : undefined;
+      } else if (existing?.status === 'SENT') {
+        const nonTerminalEditAllowed = candidate.chain === 'bsc' || sentBonding;
+        stage = !nonTerminalEditAllowed || revivalSuppressed
           ? undefined
           : realPoolPublic
             ? 'real_pool'
             : bondingPublic
               ? 'bonding'
-              : (candidate.chain === 'bsc'
-                  ? existing?.status === 'SENT'
-                  : existing !== undefined)
-                ? 'heat_wait'
-                : undefined);
-      if (candidate.chain === 'bsc' && existing?.status !== 'SENT') {
+              : 'heat_wait';
+      } else {
+        stage = revivalSuppressed
+          ? undefined
+          : realPoolPublic
+            ? 'real_pool'
+            : bondingPublic
+              ? 'bonding'
+              : undefined;
+      }
+      if (existing?.status !== 'SENT') {
         const initialPublic = stage === 'bonding' || stage === 'real_pool';
         const ready = this.qualificationEvents.has({
           chain: candidate.chain,
           tokenAddress: candidate.tokenAddress,
           stage: 'radar_public_readiness',
-          reasonCode: 'BSC_RADAR_PUBLIC_READY',
+          reasonCode: readinessReason,
           decisionRuleVersion: this.config.ruleVersion
         });
-        if (!initialPublic || !ready) stage = undefined;
+        const triggerEvidence = candidate.chain !== 'sol' || stage !== 'bonding' ||
+          this.rankSnapshots.hasCurrentTriggerEvidence(
+            candidate.chain,
+            candidate.tokenAddress,
+            publicPolicy.bondingTriggers,
+            nowMs
+          );
+        if (!initialPublic || !ready || !triggerEvidence) stage = undefined;
       }
       if (stage === undefined) continue;
       const waitReason =

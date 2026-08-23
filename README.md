@@ -69,14 +69,16 @@ block later samples.
 ## Versioned signal policy
 
 - GMGN Top100 internal candidates: `$10K–$300K`.
-- Public Bonding radar: `$10K–$100K`, with two consecutive fresh dual-rank
-  confirmations or three strictly rising 1m ranks. SOL publishes at current
-  1m Top1–5; BSC publishes at Top6–10 while Top1–5 stays internal.
+- Public Bonding radar: `$10K–$100K`. SOL publishes only after two consecutive
+  fresh dual-rank confirmations at current 1m Top1–5; three strictly rising 1m
+  ranks stay internal. BSC publishes either trigger at Top6–10 while Top1–5
+  stays internal.
 - Real-pool qualification remains internal at `$20K–$300K`, current 1m Top20
-  and liquidity of at least `$10K`. Public real-pool radar remains Top1–20 on
-  SOL and is Top6–10 on BSC. Pools up to 30 minutes are new opportunities;
-  older pools can still qualify internally as revival opportunities, but BSC
-  revival radar is not published.
+  and liquidity of at least `$10K`. SOL does not publish a direct real-pool or
+  revival first card; only a previously sent SOL Bonding card can upgrade to
+  its verified new pool. BSC publishes direct new-pool radar at Top6–10.
+  Older pools can still qualify internally as revival opportunities, but
+  revival radar is not published on either chain.
 - CoinGecko qualification: two fixed-pool details at least 10 seconds apart;
   the latest 5–10 trades must total at least `$500` with both buy-count and
   buy-USD ratios at least 60%.
@@ -87,10 +89,12 @@ block later samples.
 These values are code-versioned so old decision snapshots remain reproducible;
 they are intentionally not duplicated as environment overrides.
 
-Radar first-send payloads are stored once in the v7 SQLite schema and are not
-overwritten by later lifecycle edits. BSC public-readiness and its internal
-Top1–5 pool-open shortcut are separate audited facts; a public Top6–10 card
-never grants the shortcut by itself.
+Radar first-send payloads are stored once in SQLite and are not overwritten by
+later lifecycle edits. Public-readiness and the internal pool-open shortcut are
+separate audited facts on both chains; a public card never grants the shortcut
+by itself. Migration v8 only bridges existing eligible SOL Bonding facts and
+does not add a business table or reset candidate, qualification or evaluation
+state.
 
 The service is intentionally one Node process with one SQLite database. For a
 server deployment, use the host's existing service supervisor to run:

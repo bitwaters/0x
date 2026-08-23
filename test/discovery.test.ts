@@ -334,8 +334,52 @@ test('BSC keeps the Top3 pool-open shortcut internal while Top7 public radar gra
   database.close();
 });
 
-test('SOL keeps its Top5 public radar and status-based pool-open shortcut', async () => {
+test('SOL keeps its Top5 dual-rank radar and fact-based pool-open shortcut', async () => {
   const now = { value: 2_200_000_000 };
+  const token = 'So11111111111111111111111111111111111111112';
+  let poolOpen = false;
+  const { database, engine, candidates } = setup(now, () =>
+    tokenInfo({
+      chain: 'sol', token, fetchedAtMs: now.value,
+      pool: poolOpen ? '11111111111111111111111111111111' : null,
+      openAtMs: poolOpen ? now.value - 60_000 : null,
+      poolCreatedAtMs: poolOpen ? now.value - 31 * 60_000 : null,
+      liquidity: poolOpen ? 15_000 : 0
+    })
+  );
+  const item = trendingItem({ chain: 'sol', token, rank: 5 });
+  await engine.acceptSnapshot(snapshot('1m', now.value, [item], 'sol'));
+  now.value += 1;
+  await engine.acceptSnapshot(snapshot('5m', now.value, [item], 'sol'));
+  now.value += 10_000;
+  await engine.acceptSnapshot(snapshot('1m', now.value, [item], 'sol'));
+  assert.equal(candidates.find('sol', token)!.status, 'RADAR');
+  assert.equal(database.prepare(`
+    SELECT count(*) AS count FROM qualification_events
+    WHERE chain = 'sol' AND stage = 'bonding_shortcut_readiness'
+  `).get()!.count, 1);
+
+  now.value += 5_000;
+  await engine.acceptSnapshot(snapshot('5m', now.value, [item], 'sol'));
+  poolOpen = true;
+  now.value += 5_000;
+  await engine.acceptSnapshot(
+    snapshot('1m', now.value, [{ ...item, openAtMs: now.value - 60_000 }], 'sol')
+  );
+  assert.equal(candidates.find('sol', token)!.status, 'PREHEAT');
+  assert.equal(candidates.find('sol', token)!.opportunityType, 'revival');
+  assert.equal(
+    database.prepare(`
+      SELECT reason_code FROM qualification_events
+      WHERE chain = 'sol' AND stage = 'activation' AND outcome = 'PASS'
+    `).get()!.reason_code,
+    'RADAR_OPENED_REVIVAL_POOL'
+  );
+  database.close();
+});
+
+test('SOL three-rising heat stays internal but preserves its pool-open shortcut', async () => {
+  const now = { value: 2_300_000_000 };
   const token = 'So11111111111111111111111111111111111111112';
   let poolOpen = false;
   const { database, engine, candidates } = setup(now, () =>
@@ -347,27 +391,56 @@ test('SOL keeps its Top5 public radar and status-based pool-open shortcut', asyn
       liquidity: poolOpen ? 15_000 : 0
     })
   );
-  const item = trendingItem({ chain: 'sol', token, rank: 5 });
-  await engine.acceptSnapshot(snapshot('1m', now.value, [item], 'sol'));
-  now.value += 1;
-  await engine.acceptSnapshot(snapshot('5m', now.value, [item], 'sol'));
+  for (const [offset, rank] of [[0, 8], [3_000, 6], [6_000, 4]] as const) {
+    now.value = 2_300_000_000 + offset;
+    await engine.acceptSnapshot(
+      snapshot('1m', now.value, [trendingItem({ chain: 'sol', token, rank })], 'sol')
+    );
+  }
+
+  assert.equal(candidates.find('sol', token)!.status, 'DISCOVERED');
+  assert.equal(database.prepare(`
+    SELECT count(*) AS count FROM qualification_events
+    WHERE chain = 'sol' AND stage = 'bonding_shortcut_readiness'
+  `).get()!.count, 1);
+  assert.equal(database.prepare(`
+    SELECT count(*) AS count FROM qualification_events
+    WHERE chain = 'sol' AND stage = 'radar_public_readiness'
+  `).get()!.count, 0);
+
+  database.prepare(`
+    UPDATE candidates SET legacy_reopened_at_ms = ?
+    WHERE chain = 'sol' AND token_address = ?
+  `).run(now.value, token);
+  poolOpen = true;
   now.value += 10_000;
-  await engine.acceptSnapshot(snapshot('1m', now.value, [item], 'sol'));
-  assert.equal(candidates.find('sol', token)!.status, 'RADAR');
+  await engine.acceptSnapshot(snapshot('1m', now.value, [trendingItem({
+    chain: 'sol', token, rank: 4, openAtMs: now.value - 60_000
+  })], 'sol'));
+  assert.equal(candidates.find('sol', token)!.status, 'DISCOVERED');
+
+  poolOpen = false;
+  for (const rank of [7, 6, 4]) {
+    now.value += 3_000;
+    await engine.acceptSnapshot(
+      snapshot('1m', now.value, [trendingItem({ chain: 'sol', token, rank })], 'sol')
+    );
+  }
+  assert.equal(database.prepare(`
+    SELECT count(*) AS count FROM qualification_events
+    WHERE chain = 'sol' AND stage = 'bonding_shortcut_readiness'
+  `).get()!.count, 2);
 
   poolOpen = true;
   now.value += 10_000;
-  await engine.acceptSnapshot(
-    snapshot('1m', now.value, [{ ...item, openAtMs: now.value - 60_000 }], 'sol')
-  );
+  await engine.acceptSnapshot(snapshot('1m', now.value, [trendingItem({
+    chain: 'sol', token, rank: 4, openAtMs: now.value - 60_000
+  })], 'sol'));
   assert.equal(candidates.find('sol', token)!.status, 'PREHEAT');
-  assert.equal(
-    database.prepare(`
-      SELECT reason_code FROM qualification_events
-      WHERE chain = 'sol' AND stage = 'activation' AND outcome = 'PASS'
-    `).get()!.reason_code,
-    'RADAR_OPENED_REAL_POOL'
-  );
+  assert.equal(database.prepare(`
+    SELECT reason_code FROM qualification_events
+    WHERE chain = 'sol' AND stage = 'activation' AND outcome = 'PASS'
+  `).get()!.reason_code, 'RADAR_OPENED_REAL_POOL');
   database.close();
 });
 
