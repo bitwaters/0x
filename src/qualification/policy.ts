@@ -1,0 +1,16 @@
+export const QUALIFICATION_POLICY = Object.freeze({
+  trendingMaxAgeMs: 15_000,
+  tokenInfoMaxAgeMs: 30_000,
+  securityMaxAgeMs: 30_000,
+  allowedClockSkewMs: 2_000,
+  tradeWindowMs: 30_000,
+  tradeMinCount: 5,
+  tradeMaxCount: 10,
+  latestTradeMaxAgeMs: 15_000,
+  buyCountMinRatio: 0.6,
+  largestTradeMaxRatio: 0.4,
+  detailMinIntervalMs: 10_000,
+  liquidityMaxDeclineRatio: 0.1,
+  referenceBuyUsd: 100,
+  depthMaxRatio: 0.03
+} as const);

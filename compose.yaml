@@ -1,0 +1,38 @@
+name: meme-signal-bot
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meme-signal-bot:local
+    container_name: meme-signal-bot
+    restart: unless-stopped
+    init: true
+    user: "1000:1000"
+    env_file:
+      - .env.local
+    environment:
+      NODE_ENV: production
+      DATABASE_PATH: /app/data/meme-signal.db
+    volumes:
+      - ./data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - require('node:fs').accessSync('/app/data/meme-signal.db')
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
